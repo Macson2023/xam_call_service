@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>xam calls — тест аудио и видео связи</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' x2='1' y1='0' y2='1'%3E%3Cstop stop-color='%236d8cff'/%3E%3Cstop offset='1' stop-color='%23a06bff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Ctext x='32' y='45' font-family='Arial' font-size='38' font-weight='700' text-anchor='middle' fill='white'%3Ex%3C/text%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/client/styles.css" />
+  </head>
+  <body>
+    <div id="loginScreen" class="screen login-screen">
+      <div class="login-card">
+        <div class="brand brand--large">
+          <span class="brand-mark" aria-hidden="true">x</span>
+          <span>xam <b>calls</b></span>
+        </div>
+        <p class="lead">
+          Тестовый клиент аудио- и видеозвонков. Авторизация — через соседний
+          <code>xam_backend</code>, медиа идёт напрямую по WebRTC.
+        </p>
+
+        <div class="tabs" role="tablist" aria-label="Способ входа">
+          <button class="tab is-active" type="button" data-auth-tab="login" role="tab">
+            Вход
+          </button>
+          <button class="tab" type="button" data-auth-tab="register" role="tab">
+            Регистрация
+          </button>
+        </div>
+
+        <form id="loginForm" class="auth-form" autocomplete="on">
+          <label class="field">
+            <span>Логин</span>
+            <input id="loginUsername" name="username" required minlength="1" maxlength="32" />
+          </label>
+          <label class="field">
+            <span>Пароль</span>
+            <input
+              id="loginPassword"
+              name="password"
+              type="password"
+              required
+              minlength="1"
+              maxlength="72"
+              autocomplete="current-password"
+            />
+          </label>
+          <button id="loginSubmit" class="button button--primary" type="submit">Войти</button>
+        </form>
+
+        <form id="registerForm" class="auth-form" hidden>
+          <label class="field">
+            <span>Логин</span>
+            <input
+              id="registerUsername"
+              name="username"
+              required
+              minlength="3"
+              maxlength="32"
+              pattern="[A-Za-z0-9_]+"
+            />
+          </label>
+          <label class="field">
+            <span>Отображаемое имя</span>
+            <input id="registerDisplayName" name="display_name" required maxlength="64" />
+          </label>
+          <label class="field">
+            <span>Пароль</span>
+            <input
+              id="registerPassword"
+              name="password"
+              type="password"
+              required
+              minlength="8"
+              maxlength="72"
+              autocomplete="new-password"
+            />
+          </label>
+          <button id="registerSubmit" class="button button--primary" type="submit">
+            Создать аккаунт
+          </button>
+        </form>
+
+        <div class="divider"><span>или</span></div>
+
+        <details class="token-box">
+          <summary>Подключиться по токену xam</summary>
+          <form id="tokenForm" class="auth-form">
+            <label class="field">
+              <span>JWT access token</span>
+              <textarea
+                id="tokenInput"
+                rows="3"
+                spellcheck="false"
+                placeholder="Вставьте access_token из xam_frontend"
+              ></textarea>
+            </label>
+            <button class="button" type="submit">Подключиться</button>
+          </form>
+          <p class="hint">
+            Токен можно передать из мессенджера в hash-части ссылки:
+            <code>#token=&lt;jwt&gt;</code> — hash не отправляется на сервер.
+          </p>
+        </details>
+
+        <p id="loginNotice" class="notice" role="alert" hidden></p>
+        <p class="hint hint--muted">
+          Бэкенд: <span id="backendHint">localhost:8000</span>. Откройте клиент на
+          <code>localhost</code> или по HTTPS — иначе браузер заблокирует камеру.
+        </p>
+      </div>
+    </div>
+
+    <div id="appScreen" class="screen app-screen" hidden>
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">x</span>
+          <span>xam <b>calls</b></span>
+        </div>
+        <div class="me">
+          <div id="meAvatar" class="avatar avatar--sm">?</div>
+          <div class="me__text">
+            <strong id="meName">Пользователь</strong>
+            <span id="meLogin"></span>
+          </div>
+        </div>
+        <div class="topbar__right">
+          <span id="wsStatus" class="status-pill status-pill--offline">Нет связи</span>
+          <button id="diagBtn" class="button button--ghost" type="button">Диагностика</button>
+          <button id="logoutBtn" class="button button--ghost" type="button">Выйти</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <aside class="sidebar">
+          <section class="panel">
+            <div class="panel__head">
+              <h2>Пользователи</h2>
+              <button id="refreshUsers" class="button button--icon" type="button" title="Повторить поиск">
+                Обновить
+              </button>
+            </div>
+            <form id="searchForm" class="search">
+              <input
+                id="searchInput"
+                type="search"
+                minlength="1"
+                maxlength="32"
+                placeholder="Поиск по username"
+                autocomplete="off"
+              />
+              <button class="button" type="submit">Найти</button>
+            </form>
+            <div id="searchResults" class="results">
+              <p class="empty">Введите username, чтобы найти собеседника.</p>
+            </div>
+
+            <div class="by-id">
+              <label class="field field--compact">
+                <span>Позвонить по ID</span>
+                <input id="userIdInput" placeholder="UUID пользователя" spellcheck="false" />
+              </label>
+              <div class="row">
+                <button class="button" type="button" data-id-call="audio">Аудио</button>
+                <button class="button" type="button" data-id-call="video">Видео</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel panel--history">
+            <div class="panel__head">
+              <h2>История звонков</h2>
+              <button id="refreshHistory" class="button button--icon" type="button">Обновить</button>
+            </div>
+            <div id="historyList" class="history">
+              <p class="empty">Пока нет звонков.</p>
+            </div>
+          </section>
+        </aside>
+
+        <section class="stage">
+          <div id="previewState" class="stage-empty">
+            <div class="stage-orb" aria-hidden="true"></div>
+            <h2>Готовы к звонку</h2>
+            <p>
+              Найдите пользователя в панели слева или примите входящий звонок.
+              Для теста откройте второе окно браузера с другим аккаунтом.
+            </p>
+            <button id="localPreviewBtn" class="button" type="button">
+              Проверить камеру и микрофон
+            </button>
+            <div id="quickPreviewBox" class="quick-preview" hidden>
+              <video id="quickPreview" autoplay playsinline muted></video>
+              <button id="stopPreview" class="button button--ghost" type="button">
+                Остановить проверку
+              </button>
+            </div>
+          </div>
+
+          <div id="callStage" class="call-stage" hidden>
+            <div class="call-head">
+              <div>
+                <div id="callPeer" class="call-peer">Собеседник</div>
+                <div id="callStatus" class="call-status" aria-live="polite">Соединение…</div>
+              </div>
+              <div id="callTimer" class="call-timer">00:00</div>
+            </div>
+
+            <div id="videoGrid" class="video-grid">
+              <div class="video-tile video-tile--remote">
+                <video id="remoteVideo" autoplay playsinline></video>
+                <div id="remotePlaceholder" class="video-placeholder">
+                  <div id="remoteAvatar" class="avatar avatar--xl">?</div>
+                  <span>Ожидание собеседника</span>
+                </div>
+                <div id="remoteLabel" class="video-label">Собеседник</div>
+              </div>
+              <div class="video-tile video-tile--local">
+                <video id="localVideo" autoplay playsinline muted></video>
+                <div id="localPlaceholder" class="video-placeholder">
+                  <div id="localAvatar" class="avatar avatar--xl">Вы</div>
+                  <span>Камера выключена</span>
+                </div>
+                <div class="video-label">Вы</div>
+              </div>
+            </div>
+
+            <div class="call-foot">
+              <div id="callStats" class="stats">WebRTC: ожидание подключения</div>
+              <div class="controls">
+                <button id="muteBtn" class="button control" type="button" data-on="true">
+                  Микрофон
+                </button>
+                <button id="cameraBtn" class="button control" type="button">Камера</button>
+                <button id="hangupBtn" class="button control control--danger" type="button">
+                  Завершить
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <section id="diagPanel" class="diag" hidden>
+            <div class="panel__head">
+              <h2>Диагностика</h2>
+              <button id="clearLog" class="button button--icon" type="button">Очистить</button>
+            </div>
+            <div id="diagStatus" class="diag-status"></div>
+            <pre id="eventLog" class="event-log" aria-live="off"></pre>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="incomingModal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="incomingName">
+      <div class="modal-card">
+        <div class="ring" aria-hidden="true"></div>
+        <div id="incomingAvatar" class="avatar avatar--xl">?</div>
+        <h2 id="incomingName">Входящий звонок</h2>
+        <p id="incomingMeta" class="muted"></p>
+        <div class="modal-actions">
+          <button id="rejectBtn" class="button button--danger" type="button">Отклонить</button>
+          <button id="acceptBtn" class="button button--primary" type="button">Принять</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" hidden role="status"></div>
+
+    <script src="/client/app.js"></script>
+  </body>
+</html>
