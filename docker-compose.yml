@@ -29,6 +29,8 @@ services:
       MAX_CALL_DURATION_SECONDS: ${MAX_CALL_DURATION_SECONDS:-14400}
       WS_TICKET_TTL_SECONDS: ${WS_TICKET_TTL_SECONDS:-30}
       MAX_WS_MESSAGE_BYTES: ${MAX_WS_MESSAGE_BYTES:-98304}
+      WS_IDLE_TIMEOUT_SECONDS: ${WS_IDLE_TIMEOUT_SECONDS:-180}
+      WS_SEND_TIMEOUT_SECONDS: ${WS_SEND_TIMEOUT_SECONDS:-5}
 
       ICE_SERVERS: '${ICE_SERVERS:-[{"urls":["stun:stun.l.google.com:19302"]}]}'
       TURN_URLS: ${TURN_URLS:-}
@@ -52,6 +54,36 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    restart: unless-stopped
+
+  # STUN/TURN for WebRTC media. Without a reachable TURN server calls fail
+  # whenever both peers are behind symmetric NAT / CGNAT (connectionState=failed).
+  # TURN_EXTERNAL_IP must be the address clients use to reach this host: the LAN
+  # IP for local calls or the public IP with 3478/tcp, 3478/udp and the relay
+  # range forwarded on the router for calls over the internet.
+  turn:
+    image: coturn/coturn:4.6.3
+    command:
+      - --log-file=stdout
+      - --listening-ip=0.0.0.0
+      - --listening-port=3478
+      - --fingerprint
+      - --lt-cred-mech
+      - --realm=${TURN_REALM:-xam}
+      - --user=${TURN_USERNAME:-xam}:${TURN_CREDENTIAL:-xam-turn-change-me}
+      - --external-ip=${TURN_EXTERNAL_IP:-127.0.0.1}
+      - --min-port=${TURN_MIN_PORT:-49160}
+      - --max-port=${TURN_MAX_PORT:-49200}
+      - --no-tls
+      - --no-dtls
+      - --no-cli
+      - --no-multicast-peers
+      - --no-software-attribute
+      - --stale-nonce=600
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
     restart: unless-stopped
 
   # Same service behind HTTPS with a self-signed certificate (for camera/mic

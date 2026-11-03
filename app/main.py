@@ -40,7 +40,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     backend = BackendClient(settings)
     validator = TokenValidator(settings, introspection_client)
     directory = UserDirectory(settings, validator, backend)
-    connections = ConnectionManager()
+    connections = ConnectionManager(settings.ws_send_timeout_seconds)
     registry = CallRegistry()
     coordinator = CallCoordinator(
         connections,

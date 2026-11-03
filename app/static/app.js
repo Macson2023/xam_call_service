@@ -3,8 +3,12 @@
 const TOKEN_KEY = 'xam.call.token';
 const API_PREFIX = '/api/v1';
 const WS_PATH = '/ws/calls';
-const PING_INTERVAL = 25_000;
+const PING_INTERVAL = 10_000;
+const PONG_TIMEOUT = 8_000;
+const CONNECT_TIMEOUT = 10_000;
+const STABLE_CONNECTION_MS = 5_000;
 const MAX_RECONNECT_DELAY = 15_000;
+const SILENT_SOCKET_MS = PING_INTERVAL + PONG_TIMEOUT;
 const AVATAR_COLORS = ['#6d8cff', '#a06bff', '#35d6a4', '#f4b85e', '#ff647c', '#4fc3f7'];
 
 const state = {
@@ -14,8 +18,12 @@ const state = {
   wsStatus: 'offline',
   wsAttempts: 0,
   wsManualClose: false,
+  wsConnecting: false,
   reconnectTimer: null,
   pingTimer: null,
+  stableTimer: null,
+  lastServerMessageAt: 0,
+  localCandidates: [],
   hasConnectedOnce: false,
   serverWatched: new Set(),
   watched: new Set(),
@@ -32,6 +40,9 @@ const state = {
   localStream: null,
   remoteStream: null,
   pendingCandidates: [],
+  iceStats: null,
+  iceRestarts: 0,
+  iceFailureReported: false,
   callStartedAt: null,
   tickTimer: null,
   statsTimer: null,
@@ -316,6 +327,7 @@ function showApp() {
   setNotice('');
   setMe(state.me);
   state.wsManualClose = false;
+  state.wsAttempts = 0;
   state.hasConnectedOnce = false;
   state.serverWatched = new Set();
 }
@@ -369,6 +381,8 @@ function clearSession(message) {
   state.serverWatched = new Set();
   state.watched = new Set();
   state.hasConnectedOnce = false;
+  state.wsAttempts = 0;
+  state.localCandidates = [];
   localStorage.removeItem(TOKEN_KEY);
   $('searchInput').value = '';
   $('searchResults').innerHTML = '<p class="empty">Введите username, чтобы найти собеседника.</p>';
@@ -385,10 +399,7 @@ function detachSocket() {
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
   }
-  if (state.pingTimer) {
-    clearInterval(state.pingTimer);
-    state.pingTimer = null;
-  }
+  stopHeartbeat();
   const socket = state.ws;
   state.ws = null;
   state.serverWatched = new Set();
@@ -408,6 +419,18 @@ function detachSocket() {
 function wsUrl() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${window.location.host}${WS_PATH}`;
+}
+
+function timeoutSignal(ms) {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(ms);
+  }
+  if (typeof AbortController !== 'undefined') {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), ms);
+    return controller.signal;
+  }
+  return undefined;
 }
 
 function setWsStatus(status) {
@@ -430,17 +453,122 @@ function setWsStatus(status) {
   updateDiag();
 }
 
+function socketIsSilent(socket) {
+  return Boolean(
+    socket &&
+      socket.readyState === WebSocket.OPEN &&
+      state.lastServerMessageAt > 0 &&
+      Date.now() - state.lastServerMessageAt > SILENT_SOCKET_MS,
+  );
+}
+
+function stopHeartbeat() {
+  if (state.pingTimer) {
+    clearInterval(state.pingTimer);
+    state.pingTimer = null;
+  }
+  if (state.stableTimer) {
+    clearTimeout(state.stableTimer);
+    state.stableTimer = null;
+  }
+  state.lastServerMessageAt = 0;
+}
+
+function startHeartbeat(socket) {
+  stopHeartbeat();
+  state.lastServerMessageAt = Date.now();
+  state.pingTimer = setInterval(() => {
+    if (state.ws !== socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (socketIsSilent(socket)) {
+      logEvent('!', 'heartbeat-timeout', {
+        silent_ms: Date.now() - state.lastServerMessageAt,
+      });
+      dropSocket(socket, 'heartbeat timeout');
+      return;
+    }
+    sendRaw({ type: 'ping' }, false);
+  }, PING_INTERVAL);
+}
+
+function scheduleStableReset(socket) {
+  if (state.stableTimer) {
+    clearTimeout(state.stableTimer);
+  }
+  state.stableTimer = setTimeout(() => {
+    state.stableTimer = null;
+    if (state.ws === socket && socket.readyState === WebSocket.OPEN) {
+      state.wsAttempts = 0;
+    }
+  }, STABLE_CONNECTION_MS);
+}
+
+function dropSocket(socket, reason) {
+  if (state.ws !== socket) {
+    try {
+      socket.close();
+    } catch {
+    }
+    return;
+  }
+  state.ws = null;
+  state.serverWatched = new Set();
+  stopHeartbeat();
+  setWsStatus('reconnecting');
+  try {
+    socket.close(4000, reason);
+  } catch {
+  }
+  scheduleReconnect();
+}
+
 function scheduleReconnect() {
   if (!state.token || state.wsManualClose || state.reconnectTimer) {
     return;
   }
-  const delay = Math.min(1000 * 2 ** state.wsAttempts, MAX_RECONNECT_DELAY);
+  if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  const exponent = Math.min(state.wsAttempts, 6);
+  const base = Math.min(1000 * 2 ** exponent, MAX_RECONNECT_DELAY);
+  const delay = Math.round(base * (0.7 + Math.random() * 0.6));
   state.wsAttempts += 1;
   setWsStatus('reconnecting');
   state.reconnectTimer = setTimeout(() => {
     state.reconnectTimer = null;
-    connectWs();
+    void connectWs();
   }, delay);
+}
+
+function reconnectNow(reason, force = false) {
+  if (!state.token || state.wsManualClose) {
+    return;
+  }
+  const socket = state.ws;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    if (!force && !socketIsSilent(socket)) {
+      return;
+    }
+    state.ws = null;
+    state.serverWatched = new Set();
+    stopHeartbeat();
+    try {
+      socket.close(4000, reason);
+    } catch {
+    }
+  } else if (socket && socket.readyState === WebSocket.CONNECTING) {
+    return;
+  } else {
+    state.ws = null;
+  }
+
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+  state.wsAttempts = 0;
+  void connectWs();
 }
 
 async function connectWs() {
@@ -454,93 +582,113 @@ async function connectWs() {
   ) {
     return;
   }
+  if (state.wsConnecting) {
+    return;
+  }
 
+  state.wsConnecting = true;
+  const sessionToken = state.token;
   setWsStatus(state.wsAttempts > 0 ? 'reconnecting' : 'connecting');
 
-  let ticket;
   try {
-    const response = await api('/calls/ws-ticket', { method: 'POST' });
-    ticket = response.ticket;
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 401) {
-      clearSession('Сессия истекла. Войдите снова.');
-      return;
-    }
-    setWsStatus('offline');
-    scheduleReconnect();
-    return;
-  }
-
-  let socket;
-  try {
-    socket = new WebSocket(`${wsUrl()}?ticket=${encodeURIComponent(ticket)}`);
-  } catch {
-    setWsStatus('offline');
-    scheduleReconnect();
-    return;
-  }
-
-  state.ws = socket;
-
-  socket.onopen = () => {
-    state.wsAttempts = 0;
-    state.serverWatched = new Set();
-    setWsStatus('online');
-    if (state.pingTimer) {
-      clearInterval(state.pingTimer);
-    }
-    state.pingTimer = setInterval(() => {
-      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-        sendRaw({ type: 'ping' }, false);
+    let ticket;
+    try {
+      const response = await api('/calls/ws-ticket', {
+        method: 'POST',
+        signal: timeoutSignal(CONNECT_TIMEOUT),
+      });
+      ticket = response.ticket;
+    } catch (error) {
+      if (sessionToken !== state.token || state.wsManualClose) {
+        return;
       }
-    }, PING_INTERVAL);
-    syncWatched(true);
-  };
-
-  socket.onmessage = (message) => {
-    if (typeof message.data !== 'string') {
-      return;
-    }
-    let event;
-    try {
-      event = JSON.parse(message.data);
-    } catch {
-      logEvent('←', 'parse-error', { detail: message.data.slice(0, 80) });
-      return;
-    }
-    handleWsEvent(event).catch((error) => {
-      console.error(error);
-      toast('Ошибка обработки события звонка', 'error');
-      logEvent('!', 'handler-error', { detail: String(error?.message || error) });
-    });
-  };
-
-  socket.onclose = (event) => {
-    if (state.ws === socket) {
-      state.ws = null;
-    }
-    if (state.pingTimer) {
-      clearInterval(state.pingTimer);
-      state.pingTimer = null;
-    }
-    if (state.wsManualClose || !state.token) {
+      if (error instanceof ApiError && error.status === 401) {
+        clearSession('Сессия истекла. Войдите снова.');
+        return;
+      }
       setWsStatus('offline');
+      scheduleReconnect();
       return;
     }
-    if (event.code === 1008) {
-      clearSession('Сессия истекла. Войдите снова.');
-      return;
-    }
-    setWsStatus('reconnecting');
-    scheduleReconnect();
-  };
 
-  socket.onerror = () => {
-    try {
-      socket.close();
-    } catch {
+    if (sessionToken !== state.token || state.wsManualClose) {
+      return;
     }
-  };
+
+    let socket;
+    try {
+      socket = new WebSocket(`${wsUrl()}?ticket=${encodeURIComponent(ticket)}`);
+    } catch {
+      setWsStatus('offline');
+      scheduleReconnect();
+      return;
+    }
+
+    state.ws = socket;
+
+    socket.onopen = () => {
+      if (state.ws !== socket) {
+        try {
+          socket.close();
+        } catch {
+        }
+        return;
+      }
+      state.serverWatched = new Set();
+      setWsStatus('online');
+      startHeartbeat(socket);
+      syncWatched(true);
+    };
+
+    socket.onmessage = (message) => {
+      if (state.ws === socket) {
+        state.lastServerMessageAt = Date.now();
+      }
+      if (typeof message.data !== 'string') {
+        return;
+      }
+      let event;
+      try {
+        event = JSON.parse(message.data);
+      } catch {
+        logEvent('←', 'parse-error', { detail: message.data.slice(0, 80) });
+        return;
+      }
+      if (event?.type === 'ready' && state.ws === socket) {
+        scheduleStableReset(socket);
+      }
+      handleWsEvent(event).catch((error) => {
+        console.error(error);
+        toast('Ошибка обработки события звонка', 'error');
+        logEvent('!', 'handler-error', { detail: String(error?.message || error) });
+      });
+    };
+
+    socket.onclose = (event) => {
+      if (state.ws !== socket) {
+        return;
+      }
+      state.ws = null;
+      state.serverWatched = new Set();
+      stopHeartbeat();
+      if (state.wsManualClose || !state.token) {
+        setWsStatus('offline');
+        return;
+      }
+      if (event.code === 1008) {
+        clearSession('Сессия истекла. Войдите снова.');
+        return;
+      }
+      setWsStatus('reconnecting');
+      scheduleReconnect();
+    };
+
+    socket.onerror = () => {
+      dropSocket(socket, 'socket error');
+    };
+  } finally {
+    state.wsConnecting = false;
+  }
 }
 
 function sendRaw(payload, writeLog = true) {
@@ -654,6 +802,7 @@ function handleReady(data) {
       if (!state.pc) {
         endStaleCall(serverCall, direction);
       } else {
+        const resumed = state.hasConnectedOnce;
         state.call = serverCall;
         state.direction = direction;
         state.peer = peer;
@@ -662,6 +811,9 @@ function handleReady(data) {
         startCallTimer(serverCall.answered_at);
         if (direction === 'outgoing') {
           void maybeCreateOffer(serverCall);
+        }
+        if (resumed) {
+          resendLocalSignaling(serverCall);
         }
       }
     } else if (serverCall.state === 'ringing') {
@@ -980,6 +1132,11 @@ async function acceptIncoming() {
   }
   $('acceptBtn').disabled = true;
   $('rejectBtn').disabled = true;
+  await ensureIceConfig();
+  if (!state.token) {
+    hideIncoming();
+    return;
+  }
   try {
     await ensureLocalMedia(call.media);
   } catch (error) {
@@ -1051,6 +1208,10 @@ async function startCall(user, media) {
   }
 
   stopQuickPreview();
+  await ensureIceConfig();
+  if (!state.token) {
+    return;
+  }
   try {
     await ensureLocalMedia(media);
   } catch (error) {
@@ -1193,6 +1354,92 @@ function stopLocalStream() {
   updateDiag();
 }
 
+async function ensureIceConfig() {
+  if (!state.config) {
+    await loadConfig();
+  }
+}
+
+function iceServerUrls() {
+  const servers = state.config?.ice_servers;
+  if (!Array.isArray(servers)) {
+    return [];
+  }
+  return servers.flatMap((server) => {
+    if (!server) {
+      return [];
+    }
+    return Array.isArray(server.urls) ? server.urls : [server.urls];
+  }).filter(Boolean).map(String);
+}
+
+function hasTurnServer() {
+  return iceServerUrls().some((url) => url.startsWith('turn:') || url.startsWith('turns:'));
+}
+
+function iceServersSummary() {
+  const urls = iceServerUrls();
+  if (!urls.length) {
+    return 'не загружены (используется STUN по умолчанию)';
+  }
+  const stun = urls.filter((url) => url.startsWith('stun:') || url.startsWith('stuns:')).length;
+  const turn = urls.filter((url) => url.startsWith('turn:') || url.startsWith('turns:')).length;
+  return `STUN ${stun} · TURN ${turn}${turn ? '' : ' · TURN не настроен'}`;
+}
+
+function candidateType(candidate) {
+  const match = / typ (\w+)/.exec(candidate?.candidate || '');
+  return match ? match[1] : 'unknown';
+}
+
+function resetIceStats() {
+  state.iceStats = { host: 0, srflx: 0, relay: 0, errors: [] };
+  state.iceRestarts = 0;
+  state.iceFailureReported = false;
+}
+
+async function maybeRestartIce() {
+  const pc = state.pc;
+  const call = state.call;
+  if (!pc || !call?.id || call.state !== 'active' || state.direction !== 'outgoing') {
+    return;
+  }
+  if (state.iceRestarts >= 2 || pc.signalingState !== 'stable') {
+    return;
+  }
+  state.iceRestarts += 1;
+  state.localCandidates = [];
+  logEvent('!', 'ice-restart', { attempt: state.iceRestarts });
+  try {
+    if (typeof pc.restartIce === 'function') {
+      pc.restartIce();
+    }
+    const offer = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(offer);
+    sendSignal('webrtc.offer', call.id, { sdp: pc.localDescription.sdp });
+  } catch (error) {
+    logEvent('!', 'ice-restart-error', { detail: String(error?.message || error) });
+  }
+}
+
+function reportIceFailure(reason) {
+  const detail = `${reason || 'connection failed'} · ${iceServersSummary()} · host ${
+    state.iceStats?.host || 0
+  } srflx ${state.iceStats?.srflx || 0} relay ${state.iceStats?.relay || 0}`;
+  const firstFailure = !state.iceFailureReported;
+  state.iceFailureReported = true;
+  logEvent('!', firstFailure ? 'ice-failed' : 'ice-failed-again', { detail });
+  if (firstFailure) {
+    toast(
+      hasTurnServer()
+        ? 'WebRTC не установил соединение. Проверьте доступность TURN (порты 3478 и 49160-49200) и STUN.'
+        : 'WebRTC не установил соединение: TURN не настроен. Задайте TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL.',
+      'error',
+    );
+  }
+  void maybeRestartIce();
+}
+
 async function createPeer(call) {
   if (state.pc) {
     return state.pc;
@@ -1201,6 +1448,7 @@ async function createPeer(call) {
     state.config?.ice_servers && state.config.ice_servers.length
       ? state.config.ice_servers
       : [{ urls: ['stun:stun.l.google.com:19302'] }];
+  logEvent('·', 'ice-config', { detail: iceServersSummary() });
 
   const pc = new RTCPeerConnection({
     iceServers,
@@ -1208,7 +1456,8 @@ async function createPeer(call) {
     rtcpMuxPolicy: 'require',
   });
   state.pc = pc;
-  state.pendingCandidates = [];
+  state.localCandidates = [];
+  resetIceStats();
 
   if (state.localStream) {
     state.localStream.getTracks().forEach((track) => {
@@ -1217,11 +1466,37 @@ async function createPeer(call) {
   }
 
   pc.onicecandidate = (event) => {
-    if (event.candidate && state.call?.id) {
-      sendSignal('webrtc.ice', state.call.id, {
-        candidate: event.candidate.toJSON(),
-      });
+    if (!event.candidate) {
+      return;
     }
+    const candidate = event.candidate.toJSON();
+    const type = candidateType(candidate);
+    if (type in state.iceStats) {
+      state.iceStats[type] += 1;
+      if (state.iceStats[type] === 1) {
+        logEvent('·', `ice-${type}`, { candidate });
+      }
+    }
+    state.localCandidates.push(candidate);
+    if (state.localCandidates.length > 300) {
+      state.localCandidates.shift();
+    }
+    if (state.call?.id) {
+      sendSignal('webrtc.ice', state.call.id, { candidate });
+    }
+  };
+
+  pc.onicecandidateerror = (event) => {
+    if (!state.iceStats) {
+      return;
+    }
+    const detail = `${event.address || '?'}:${event.port || '?'} ${
+      event.errorCode || ''
+    } ${event.errorText || ''}`.trim();
+    if (state.iceStats.errors.length < 5) {
+      state.iceStats.errors.push(detail);
+    }
+    logEvent('!', 'ice-candidate-error', { detail });
   };
 
   pc.ontrack = (event) => {
@@ -1238,12 +1513,17 @@ async function createPeer(call) {
 
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'failed') {
-      toast('WebRTC не установил соединение. Проверьте STUN/TURN.', 'error');
+      reportIceFailure('connectionState=failed');
     }
     updateCallUi();
   };
 
-  pc.oniceconnectionstatechange = () => updateDiag();
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'failed') {
+      reportIceFailure('iceConnectionState=failed');
+    }
+    updateDiag();
+  };
   pc.onicegatheringstatechange = () => updateDiag();
   pc.onsignalingstatechange = () => updateDiag();
 
@@ -1266,6 +1546,24 @@ async function maybeCreateOffer(call) {
   });
   await pc.setLocalDescription(offer);
   sendSignal('webrtc.offer', call.id, { sdp: pc.localDescription.sdp });
+}
+
+function resendLocalSignaling(call) {
+  const pc = state.pc;
+  if (!pc || !call?.id) {
+    return;
+  }
+  try {
+    if (pc.localDescription?.sdp) {
+      const type = pc.localDescription.type === 'offer' ? 'webrtc.offer' : 'webrtc.answer';
+      sendSignal(type, call.id, { sdp: pc.localDescription.sdp });
+    }
+    state.localCandidates.forEach((candidate) => {
+      sendSignal('webrtc.ice', call.id, { candidate });
+    });
+  } catch (error) {
+    logEvent('!', 'resend-error', { detail: String(error?.message || error) });
+  }
 }
 
 async function handleOffer(data) {
@@ -1334,6 +1632,7 @@ function closePeer() {
   const pc = state.pc;
   state.pc = null;
   state.pendingCandidates = [];
+  state.localCandidates = [];
   if (pc) {
     pc.onicecandidate = null;
     pc.ontrack = null;
@@ -1728,6 +2027,15 @@ function updateDiag() {
     ['WebSocket', state.wsStatus],
     ['Звонок', call ? `${shortId(call.id)} · ${call.state || 'preparing'} · ${call.media}` : '—'],
     ['Собеседник', state.peer ? `${displayName(state.peer)} · ${shortId(state.peer.id)}` : '—'],
+    ['ICE-серверы', iceServersSummary()],
+    [
+      'ICE-кандидаты',
+      state.iceStats
+        ? `host ${state.iceStats.host} · srflx ${state.iceStats.srflx} · relay ${
+            state.iceStats.relay
+          }${state.iceStats.errors.length ? ` · ошибок ${state.iceStats.errors.length}` : ''}`
+        : '—',
+    ],
     ['ICE connection', state.pc?.iceConnectionState || '—'],
     ['Peer connection', state.pc?.connectionState || '—'],
     ['Signaling', state.pc?.signalingState || '—'],
@@ -1908,24 +2216,18 @@ function bindApp() {
   $('rejectBtn').addEventListener('click', rejectIncoming);
 
   window.addEventListener('online', () => {
-    if (state.token && !state.ws) {
-      if (state.reconnectTimer) {
-        clearTimeout(state.reconnectTimer);
-        state.reconnectTimer = null;
-      }
-      state.wsAttempts = 0;
-      connectWs();
-    }
+    reconnectNow('network online', true);
   });
 
   window.addEventListener('offline', () => {
-    setWsStatus('offline');
+    if (!state.ws) {
+      setWsStatus('offline');
+    }
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && state.token && !state.ws) {
-      state.wsAttempts = 0;
-      connectWs();
+    if (document.visibilityState === 'visible') {
+      reconnectNow('page visible');
     }
   });
 

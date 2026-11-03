@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     max_call_duration_seconds: int = 4 * 60 * 60
     ws_ticket_ttl_seconds: int = 30
     max_ws_message_bytes: int = 96 * 1024
+    ws_idle_timeout_seconds: int = 180
+    ws_send_timeout_seconds: float = 5.0
 
     ice_servers: Annotated[list[dict], NoDecode] = Field(
         default_factory=lambda: [dict(server) for server in DEFAULT_STUN]

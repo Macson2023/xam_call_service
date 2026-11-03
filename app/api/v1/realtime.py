@@ -288,9 +288,24 @@ async def calls_websocket(websocket: WebSocket) -> None:
     await coordinator.flush_pending(identity.id)
 
     limiter = RateLimiter()
+    idle_timeout = state.settings.ws_idle_timeout_seconds
     try:
         while True:
-            raw = await websocket.receive_text()
+            try:
+                if idle_timeout > 0:
+                    raw = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=idle_timeout,
+                    )
+                else:
+                    raw = await websocket.receive_text()
+            except TimeoutError:
+                logger.info("Closing idle signaling session for user %s", identity.id)
+                try:
+                    await websocket.close(code=status.WS_1001_GOING_AWAY)
+                except Exception:
+                    pass
+                break
             if len(raw.encode("utf-8")) > state.settings.max_ws_message_bytes:
                 await _send_error(websocket, "payload_too_large", "Message is too large")
                 continue

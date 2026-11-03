@@ -49,7 +49,7 @@ flowchart LR
   работает через тот же nginx/Vite-прокси и поддерживает мгновенную доставку
   событий.
 - Для звонков через NAT нужен **TURN** (см. `TURN_URLS`), иначе часть соединений
-  не установится. STUN по умолчанию — Google STUN.
+  не установится. Docker Compose поднимает coturn, который работает и как STUN.
 - Групповые звонки потребуют SFU (например, LiveKit или mediasoup): текущая
   версия — только 1:1.
 
@@ -280,13 +280,25 @@ fallback `?token=<jwt>`, но тикет предпочтительнее: acces
 - принимать/отклонять входящие, звонить аудио/видео;
 - показывать локальный и удалённый поток, таймер, битрейт/разрешение/ fps;
 - переключать микрофон и камеру;
-- вести журнал сигналинга и диагностику WebRTC;
+- вести журнал сигналинга и диагностику WebRTC (ICE-серверы, типы кандидатов
+  `host`/`srflx`/`relay`, ошибки ICE);
 - показывать историю звонков;
 - проверять камеру/микрофон без звонка.
 
 Клиент использует один WebSocket и `RTCPeerConnection` с ICE-серверами из
 `/api/v1/calls/config`. При кратком обрыве WS он переподключается с
-экспоненциальной задержкой; активный PC при этом сохраняется.
+экспоненциальной задержкой и случайным разбросом; активный PC при этом
+сохраняется.
+
+Для устойчивости подключения клиент:
+
+- проверяет сессию прикладным `ping` каждые 10 секунд и считает сокет мёртвым,
+  если 18 секунд не пришло ни одного сообщения;
+- не открывает второй сокет параллельно и игнорирует события устаревших сокетов;
+- сбрасывает backoff только после устойчивой сессии, а не сразу после `open`;
+- мгновенно переподключается при `online` и возврате на вкладку;
+- после переподключения повторно отправляет текущие SDP и ICE-кандидаты, чтобы
+  звонок восстановился, даже если часть сигналов потерялась во время обрыва.
 
 ## Docker
 
@@ -332,10 +344,47 @@ docker compose up -d --build
 docker compose cp calls-tls:/etc/nginx/certs/server.crt ./server.crt
 ```
 
-Только HTTP, без HTTPS-сайдкара:
+### STUN/TURN
+
+Compose поднимает `turn` (coturn 4.6.3): STUN и TURN на `3478/udp`, `3478/tcp`,
+relay-порты `49160-49200/udp`. Клиент получает адреса из `/api/v1/calls/config`,
+поэтому TURN-доступ задаётся в `.env` один раз:
 
 ```bash
-docker compose up --build calls
+ICE_SERVERS=[{"urls":["stun:192.168.1.50:3478","stun:stun.l.google.com:19302"]}]
+TURN_URLS=turn:192.168.1.50:3478?transport=udp,turn:192.168.1.50:3478?transport=tcp
+TURN_USERNAME=xam
+TURN_CREDENTIAL=change-me
+TURN_REALM=xam
+TURN_EXTERNAL_IP=192.168.1.50
+TURN_MIN_PORT=49160
+TURN_MAX_PORT=49200
+```
+
+`TURN_EXTERNAL_IP` — адрес, который видят браузеры. Для звонков внутри LAN это
+IP хоста. Для звонков через интернет — публичный IP, при этом на роутере нужно
+пробросить `3478/tcp`, `3478/udp` и диапазон `49160-49200/udp` на хост с Docker,
+а `TURN_EXTERNAL_IP` должен совпадать с публичным адресом. Если сервер за NAT,
+используйте формат `PUBLIC_IP/PRIVATE_IP`.
+
+Проверка STUN:
+
+```bash
+docker run --rm --entrypoint turnutils_stunclient coturn/coturn:4.6.3 \
+  -p 3478 <TURN_EXTERNAL_IP>
+```
+
+Ожидаемый ответ — `UDP reflexive addr`. Если адрес не отвечает, проверьте
+firewall/проброс портов; при `connectionState=failed` в диагностике клиента
+видно, сколько получено `host`/`srflx`/`relay` кандидатов.
+
+> В TURN-кредах не используйте `$`, кавычки и пробелы: entrypoint образа coturn
+> раскрывает аргументы командной строки через `eval`.
+
+Только HTTP, без HTTPS-сайдкара (coturn нужен для звонков через NAT):
+
+```bash
+docker compose up --build calls turn
 ```
 
 Контейнер по умолчанию обращается к бэкенду по адресу
@@ -381,9 +430,14 @@ docker run --rm -p 8081:8081 \
 | `MAX_CALL_DURATION_SECONDS` | `14400` | Лимит звонка, `0` — без лимита |
 | `WS_TICKET_TTL_SECONDS` | `30` | Время жизни WS-тикета |
 | `MAX_WS_MESSAGE_BYTES` | `98304` | Максимальный размер WS-сообщения |
-| `ICE_SERVERS` | Google STUN | JSON-массив `RTCIceServer` |
-| `TURN_URLS` | — | TURN URL через запятую |
-| `TURN_USERNAME` / `TURN_CREDENTIAL` | — | TURN-доступ |
+| `WS_IDLE_TIMEOUT_SECONDS` | `180` | Закрывать сокет без входящих сообщений; `0` — не закрывать |
+| `WS_SEND_TIMEOUT_SECONDS` | `5` | Таймаут отправки в сокет; медленные клиенты отбрасываются |
+| `ICE_SERVERS` | Google STUN | JSON-массив `RTCIceServer` (STUN и/или TURN) |
+| `TURN_URLS` | — | TURN URL через запятую (`turn:`/`turns:`) |
+| `TURN_USERNAME` / `TURN_CREDENTIAL` | — | TURN-доступ (static long-term credentials) |
+| `TURN_REALM` | `xam` | Realm coturn для long-term credentials |
+| `TURN_EXTERNAL_IP` | `127.0.0.1` | Адрес relay-кандидатов: LAN IP, публичный IP или `PUBLIC/PRIVATE` |
+| `TURN_MIN_PORT` / `TURN_MAX_PORT` | `49160` / `49200` | Диапазон relay-портов UDP |
 | `CORS_ORIGINS` | localhost-порты | Разрешённые origin через запятую |
 | `CALLS_PORT` | `8081` | Хост-порт HTTP |
 | `CALLS_TLS_PORT` | `8443` | Хост-порт HTTPS |
@@ -454,6 +508,8 @@ tests/             # pytest: auth, registry, signaling, proxy
 | `401` на всех запросах | Ключ JWT, срок действия токена, `AUTH_MODE` |
 | «Пользователь не в сети» | Второй пользователь не подключил WS или не открыл клиент |
 | Нет видео/звука, но звонок «в эфире» | NAT: нужен TURN (`TURN_URLS`), проверьте `chrome://webrtc-internals` |
+| «WebRTC не установил соединение» | В диагностике клиента: `ICE-серверы` и `ICE-кандидаты` (`relay 0` — TURN недоступен). Проверьте `TURN_EXTERNAL_IP`, порты `3478` и `49160-49200`, firewall и креды |
+| STUN не отвечает | `docker logs xam_call_service-turn-1`; `TURN_EXTERNAL_IP` не должен быть адресом контейнера `172.x` для внешних клиентов |
 | Браузер не даёт камеру | Открывайте `localhost` или HTTPS, разрешите доступ |
 | `Auth service is unavailable` | `xam_backend` не запущен или неверный `BACKEND_BASE_URL` |
 | История пустая сразу после звонка | Обновите: запись сохраняется фоновой задачей; API истории дожидается её |

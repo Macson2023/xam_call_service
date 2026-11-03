@@ -10,11 +10,12 @@ logger = logging.getLogger(__name__)
 class ConnectionManager:
     """In-memory registry of signaling WebSocket sessions and presence watchers."""
 
-    def __init__(self) -> None:
+    def __init__(self, send_timeout_seconds: float = 5.0) -> None:
         self._connections: dict[UUID, set[WebSocket]] = {}
         self._watchers: dict[UUID, set[WebSocket]] = {}
         self._watch_by_socket: dict[WebSocket, set[UUID]] = {}
         self._lock = asyncio.Lock()
+        self.send_timeout_seconds = send_timeout_seconds
 
     async def connect(self, user_id: UUID, websocket: WebSocket) -> bool:
         async with self._lock:
@@ -47,12 +48,26 @@ class ConnectionManager:
     def online_count(self, user_id: UUID) -> int:
         return len(self._connections.get(user_id, ()))
 
+    async def _send(self, websocket: WebSocket, payload: dict) -> bool:
+        try:
+            if self.send_timeout_seconds > 0:
+                await asyncio.wait_for(
+                    websocket.send_json(payload),
+                    timeout=self.send_timeout_seconds,
+                )
+            else:
+                await websocket.send_json(payload)
+            return True
+        except Exception:
+            return False
+
     async def send_to_user(self, user_id: UUID, payload: dict) -> None:
         connections = list(self._connections.get(user_id, ()))
-        for websocket in connections:
-            try:
-                await websocket.send_json(payload)
-            except Exception:
+        if not connections:
+            return
+        results = await asyncio.gather(*(self._send(ws, payload) for ws in connections))
+        for websocket, delivered in zip(connections, results, strict=False):
+            if not delivered:
                 logger.debug("Dropping dead signaling socket for user %s", user_id)
                 await self.disconnect(user_id, websocket)
 
@@ -90,16 +105,18 @@ class ConnectionManager:
                 "in_call": in_call,
             },
         }
-        for websocket in watchers:
-            try:
-                await websocket.send_json(payload)
-            except Exception:
+        results = await asyncio.gather(*(self._send(ws, payload) for ws in watchers))
+        for websocket, delivered in zip(watchers, results, strict=False):
+            if not delivered:
                 logger.debug("Dropping dead presence watcher for user %s", user_id)
-                async with self._lock:
-                    targets = self._watch_by_socket.pop(websocket, set())
-                    for target_id in targets:
-                        target_watchers = self._watchers.get(target_id)
-                        if target_watchers is not None:
-                            target_watchers.discard(websocket)
-                            if not target_watchers:
-                                self._watchers.pop(target_id, None)
+                await self._drop_watcher(websocket)
+
+    async def _drop_watcher(self, websocket: WebSocket) -> None:
+        async with self._lock:
+            targets = self._watch_by_socket.pop(websocket, set())
+            for target_id in targets:
+                target_watchers = self._watchers.get(target_id)
+                if target_watchers is not None:
+                    target_watchers.discard(websocket)
+                    if not target_watchers:
+                        self._watchers.pop(target_id, None)

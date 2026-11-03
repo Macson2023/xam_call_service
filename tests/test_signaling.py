@@ -1,7 +1,9 @@
 import time
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from tests.conftest import auth_headers, connect, make_user, receive_type
 
@@ -18,6 +20,20 @@ def test_ping_pong(client: TestClient) -> None:
         assert websocket.receive_json() == {"type": "pong"}
         websocket.send_json({"type": "ping"})
         assert websocket.receive_json() == {"type": "pong"}
+
+
+def test_idle_session_is_closed(client: TestClient) -> None:
+    user = make_user()
+    old_timeout = client.app.state.settings.ws_idle_timeout_seconds
+    client.app.state.settings.ws_idle_timeout_seconds = 1
+    try:
+        with connect(client, user) as websocket:
+            _ready(websocket)
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                websocket.receive_json()
+            assert excinfo.value.code == 1001
+    finally:
+        client.app.state.settings.ws_idle_timeout_seconds = old_timeout
 
 
 def test_invalid_json_returns_error(client: TestClient) -> None:
