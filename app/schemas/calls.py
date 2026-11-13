@@ -28,11 +28,34 @@ class CallOut(BaseModel):
     duration_seconds: int = 0
 
 
+class ConferenceParticipantOut(BaseModel):
+    user: CallUserOut
+    state: str
+    joined_at: datetime | None = None
+
+
+class ConferenceOut(BaseModel):
+    id: str
+    kind: str = "conference"
+    host_id: str
+    title: str | None = None
+    media: str
+    state: str
+    status: str
+    end_reason: str | None = None
+    created_at: datetime
+    ended_at: datetime | None = None
+    max_participants: int
+    participants: list[ConferenceParticipantOut]
+    joined_ids: list[str]
+
+
 class CallConfigOut(BaseModel):
     ice_servers: list[dict]
     ring_timeout_seconds: int
     disconnect_grace_seconds: int
     max_call_duration_seconds: int
+    max_conference_participants: int
     media: list[str]
 
 

@@ -520,7 +520,7 @@ textarea::placeholder {
 
 .user-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
   padding: 9px;
@@ -1147,4 +1147,121 @@ textarea::placeholder {
   .topbar__right .button {
     display: none;
   }
+}
+
+.user-row__pick {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.user-row__pick input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.panel--conference .muted {
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.conference-form {
+  display: grid;
+  gap: 8px;
+}
+
+.conference-form .row {
+  display: flex;
+  gap: 8px;
+}
+
+.conference-join {
+  margin-top: 2px;
+}
+
+.conference-join input {
+  min-width: 0;
+}
+
+.conference-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  align-content: start;
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.conf-tile {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #05070c;
+  aspect-ratio: 16 / 10;
+  min-height: 140px;
+}
+
+.conf-tile video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.conf-tile--self video {
+  transform: scaleX(-1);
+}
+
+.conf-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background:
+    radial-gradient(circle at 50% 35%, rgba(109, 140, 255, 0.2), transparent 48%),
+    linear-gradient(160deg, #0b101b, #070a12);
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.conf-placeholder[hidden] {
+  display: none !important;
+}
+
+.conf-label {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  max-width: calc(100% - 16px);
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(3, 5, 9, 0.62);
+  color: #dce5fa;
+  font-size: 0.7rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  backdrop-filter: blur(8px);
+}
+
+.conference-grid.audio-only {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.conference-grid.audio-only .conf-tile {
+  aspect-ratio: 1;
+}
+
+.conference-grid.audio-only .conf-tile video {
+  display: none;
 }

@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from app.core.auth import AuthError, UserIdentity
+from app.realtime.conferences import ConferenceRegistry
 from app.realtime.connections import ConnectionManager
 from app.realtime.coordinator import CallCoordinator
 from app.realtime.events import error_event, presence_state, ready_event
@@ -22,6 +23,8 @@ router = APIRouter(tags=["realtime"])
 MAX_SDP_LENGTH = 64_000
 MAX_CANDIDATE_LENGTH = 4_096
 MAX_PRESENCE_IDS = 100
+MAX_CONFERENCE_INVITEES = 32
+MAX_CONFERENCE_TITLE = 120
 
 
 class RateLimiter:
@@ -49,6 +52,39 @@ def _parse_uuid(data: dict, key: str) -> UUID:
         return UUID(str(data.get(key)))
     except (TypeError, ValueError) as exc:
         raise CallError("invalid_payload", f"Invalid {key}", 422) from exc
+
+
+def _parse_user_id_list(data: dict, key: str) -> list[UUID]:
+    values = data.get(key)
+    if values is None:
+        return []
+    if not isinstance(values, list) or len(values) > MAX_CONFERENCE_INVITEES:
+        raise CallError("invalid_payload", f"{key} must be a list", 422)
+    ids: list[UUID] = []
+    seen: set[UUID] = set()
+    for value in values:
+        try:
+            parsed = UUID(str(value))
+        except (TypeError, ValueError) as exc:
+            raise CallError("invalid_payload", "Invalid user id", 422) from exc
+        if parsed not in seen:
+            seen.add(parsed)
+            ids.append(parsed)
+    return ids
+
+
+def _parse_title(data: dict) -> str | None:
+    title = data.get("title")
+    if title is None:
+        return None
+    if not isinstance(title, str):
+        raise CallError("invalid_payload", "Invalid conference title", 422)
+    title = title.strip()
+    if not title:
+        return None
+    if len(title) > MAX_CONFERENCE_TITLE:
+        raise CallError("invalid_payload", "Conference title is too long", 422)
+    return title
 
 
 def _sanitize_candidate(value: object) -> dict | None:
@@ -99,6 +135,7 @@ async def _handle_event(
     *,
     connections: ConnectionManager,
     registry: CallRegistry,
+    conferences: ConferenceRegistry,
     coordinator: CallCoordinator,
     limiter: RateLimiter,
 ) -> None:
@@ -140,7 +177,9 @@ async def _handle_event(
                     presence_state(
                         user_id,
                         online=connections.is_online(user_id),
-                        in_call=registry.is_in_call(user_id),
+                        in_call=(
+                            registry.is_in_call(user_id) or conferences.is_in_conference(user_id)
+                        ),
                     )
                 )
             return
@@ -173,23 +212,111 @@ async def _handle_event(
             await coordinator.hangup(_parse_uuid(data, "call_id"), identity.id)
             return
 
+        if event_type == "conference.create":
+            media = data.get("media")
+            if not isinstance(media, str):
+                raise CallError("invalid_payload", "Invalid media", 422)
+            await coordinator.create_conference(
+                identity,
+                media,
+                _parse_title(data),
+                _parse_user_id_list(data, "invitee_ids"),
+            )
+            return
+
+        if event_type == "conference.join":
+            await coordinator.join_conference(
+                _parse_uuid(data, "conference_id"),
+                identity.id,
+            )
+            return
+
+        if event_type == "conference.decline":
+            await coordinator.decline_conference(
+                _parse_uuid(data, "conference_id"),
+                identity.id,
+            )
+            return
+
+        if event_type == "conference.leave":
+            await coordinator.leave_conference(
+                _parse_uuid(data, "conference_id"),
+                identity.id,
+            )
+            return
+
+        if event_type == "conference.end":
+            await coordinator.end_conference(
+                _parse_uuid(data, "conference_id"),
+                identity.id,
+            )
+            return
+
+        if event_type == "conference.invite":
+            await coordinator.invite_to_conference(
+                _parse_uuid(data, "conference_id"),
+                identity,
+                _parse_user_id_list(data, "user_ids"),
+            )
+            return
+
+        if event_type == "conference.resync":
+            renegotiate = data.get("renegotiate", False)
+            if not isinstance(renegotiate, bool):
+                raise CallError("invalid_payload", "Invalid renegotiate flag", 422)
+            await coordinator.resync_conference(
+                _parse_uuid(data, "conference_id"),
+                identity.id,
+                renegotiate,
+            )
+            return
+
+        if event_type == "conference.renegotiate":
+            await coordinator.renegotiate_conference(
+                _parse_uuid(data, "conference_id"),
+                identity.id,
+                _parse_uuid(data, "to_user_id"),
+            )
+            return
+
         if event_type in {"webrtc.offer", "webrtc.answer"}:
-            call_id = _parse_uuid(data, "call_id")
             sdp = data.get("sdp")
             if not isinstance(sdp, str) or not sdp.strip() or len(sdp) > MAX_SDP_LENGTH:
                 raise CallError("invalid_payload", "Invalid SDP", 422)
-            await coordinator.relay_signal(call_id, identity.id, event_type, {"sdp": sdp})
+            if data.get("conference_id") is not None:
+                await coordinator.relay_conference_signal(
+                    _parse_uuid(data, "conference_id"),
+                    identity.id,
+                    _parse_uuid(data, "to_user_id"),
+                    event_type,
+                    {"sdp": sdp},
+                )
+            else:
+                await coordinator.relay_signal(
+                    _parse_uuid(data, "call_id"),
+                    identity.id,
+                    event_type,
+                    {"sdp": sdp},
+                )
             return
 
         if event_type == "webrtc.ice":
-            call_id = _parse_uuid(data, "call_id")
             candidate = _sanitize_candidate(data.get("candidate"))
-            await coordinator.relay_signal(
-                call_id,
-                identity.id,
-                event_type,
-                {"candidate": candidate},
-            )
+            if data.get("conference_id") is not None:
+                await coordinator.relay_conference_signal(
+                    _parse_uuid(data, "conference_id"),
+                    identity.id,
+                    _parse_uuid(data, "to_user_id"),
+                    event_type,
+                    {"candidate": candidate},
+                )
+            else:
+                await coordinator.relay_signal(
+                    _parse_uuid(data, "call_id"),
+                    identity.id,
+                    event_type,
+                    {"candidate": candidate},
+                )
             return
 
         await _send_error(websocket, "unknown_event", "Unknown event type")
@@ -245,19 +372,20 @@ async def _finalize_session(
     websocket: WebSocket,
     connections: ConnectionManager,
     registry: CallRegistry,
+    conferences: ConferenceRegistry,
     coordinator: CallCoordinator,
 ) -> None:
+    def in_call() -> bool:
+        return registry.is_in_call(identity.id) or conferences.is_in_conference(identity.id)
+
     try:
         last_session = await connections.disconnect(identity.id, websocket)
         if not last_session:
             return
-        had_call = registry.is_in_call(identity.id)
+        had_call = in_call()
         await coordinator.handle_disconnect(identity.id)
-        if not had_call or registry.is_in_call(identity.id):
-            await connections.notify_presence(
-                identity.id,
-                in_call=registry.is_in_call(identity.id),
-            )
+        if not had_call or in_call():
+            await connections.notify_presence(identity.id, in_call=in_call())
     except Exception:
         logger.exception("Failed to finalize signaling session for user %s", identity.id)
 
@@ -271,6 +399,7 @@ async def calls_websocket(websocket: WebSocket) -> None:
 
     connections: ConnectionManager = state.connections
     registry: CallRegistry = state.registry
+    conferences: ConferenceRegistry = state.conferences
     coordinator: CallCoordinator = state.coordinator
 
     await websocket.accept()
@@ -278,12 +407,14 @@ async def calls_websocket(websocket: WebSocket) -> None:
     await coordinator.handle_connect(identity.id)
 
     active = registry.active_for(identity.id)
-    await websocket.send_json(ready_event(identity, active, state.settings))
+    conference = conferences.current_for(identity.id)
+    await websocket.send_json(ready_event(identity, active, conference, state.settings))
 
     if first_session:
+        await coordinator.notify_conference_reconnected(identity.id)
         await connections.notify_presence(
             identity.id,
-            in_call=registry.is_in_call(identity.id),
+            in_call=(registry.is_in_call(identity.id) or conferences.is_in_conference(identity.id)),
         )
     await coordinator.flush_pending(identity.id)
 
@@ -315,6 +446,7 @@ async def calls_websocket(websocket: WebSocket) -> None:
                 raw,
                 connections=connections,
                 registry=registry,
+                conferences=conferences,
                 coordinator=coordinator,
                 limiter=limiter,
             )
@@ -324,7 +456,14 @@ async def calls_websocket(websocket: WebSocket) -> None:
         logger.exception("Signaling session failed for user %s", identity.id)
     finally:
         finalizer = asyncio.create_task(
-            _finalize_session(identity, websocket, connections, registry, coordinator),
+            _finalize_session(
+                identity,
+                websocket,
+                connections,
+                registry,
+                conferences,
+                coordinator,
+            ),
             name=f"finalize-ws-{identity.id}",
         )
         try:

@@ -17,6 +17,7 @@ from app.core.auth import TokenValidator
 from app.core.config import settings
 from app.core.errors import http_error_handler, validation_error_handler
 from app.db.session import async_session_factory, engine, init_db
+from app.realtime.conferences import ConferenceRegistry
 from app.realtime.connections import ConnectionManager
 from app.realtime.coordinator import CallCoordinator
 from app.realtime.registry import CallRegistry
@@ -42,9 +43,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     directory = UserDirectory(settings, validator, backend)
     connections = ConnectionManager(settings.ws_send_timeout_seconds)
     registry = CallRegistry()
+    conferences = ConferenceRegistry(settings.max_conference_participants)
     coordinator = CallCoordinator(
         connections,
         registry,
+        conferences,
         directory,
         settings,
         async_session_factory,
@@ -57,6 +60,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.directory = directory
     application.state.connections = connections
     application.state.registry = registry
+    application.state.conferences = conferences
     application.state.coordinator = coordinator
     application.state.tickets = tickets
 

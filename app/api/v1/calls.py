@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
+    get_conferences,
     get_coordinator,
     get_current_identity,
     get_registry,
@@ -12,6 +13,7 @@ from app.api.deps import (
 from app.core.auth import UserIdentity
 from app.core.config import settings
 from app.db.session import get_db
+from app.realtime.conferences import ConferenceRegistry
 from app.realtime.coordinator import CallCoordinator
 from app.realtime.registry import CallRegistry
 from app.realtime.tickets import WsTicketStore
@@ -19,6 +21,7 @@ from app.schemas.calls import (
     CallConfigOut,
     CallHistoryPage,
     CallOut,
+    ConferenceOut,
     WsTicketOut,
 )
 from app.services.history import CallHistoryService
@@ -33,6 +36,7 @@ async def call_config(_: UserIdentity = Depends(get_current_identity)) -> dict:
         "ring_timeout_seconds": settings.ring_timeout_seconds,
         "disconnect_grace_seconds": settings.disconnect_grace_seconds,
         "max_call_duration_seconds": settings.max_call_duration_seconds,
+        "max_conference_participants": settings.max_conference_participants,
         "media": ["audio", "video"],
     }
 
@@ -65,6 +69,15 @@ async def active_call(
 ) -> dict | None:
     call = registry.active_for(identity.id)
     return call.to_dict() if call is not None else None
+
+
+@router.get("/conference", response_model=ConferenceOut | None)
+async def active_conference(
+    identity: UserIdentity = Depends(get_current_identity),
+    conferences: ConferenceRegistry = Depends(get_conferences),
+) -> dict | None:
+    conference = conferences.current_for(identity.id)
+    return conference.to_dict() if conference is not None else None
 
 
 @router.get("/{call_id}", response_model=CallOut)

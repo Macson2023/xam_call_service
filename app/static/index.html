@@ -19,8 +19,8 @@
           <span>xam <b>calls</b></span>
         </div>
         <p class="lead">
-          Тестовый клиент аудио- и видеозвонков. Авторизация — через соседний
-          <code>xam_backend</code>, медиа идёт напрямую по WebRTC.
+          Тестовый клиент аудио- и видеозвонков и конференций. Авторизация — через
+          соседний <code>xam_backend</code>, медиа идёт напрямую по WebRTC.
         </p>
 
         <div class="tabs" role="tablist" aria-label="Способ входа">
@@ -171,6 +171,41 @@
             </div>
           </section>
 
+          <section class="panel panel--conference">
+            <div class="panel__head">
+              <h2>Конференция</h2>
+              <span id="confSelection" class="muted">0 выбрано</span>
+            </div>
+            <div class="conference-form">
+              <input
+                id="conferenceTitle"
+                type="text"
+                maxlength="120"
+                placeholder="Название комнаты (необязательно)"
+                autocomplete="off"
+              />
+              <div class="row">
+                <button id="createConferenceAudio" class="button" type="button">Аудио</button>
+                <button id="createConferenceVideo" class="button" type="button">Видео</button>
+              </div>
+              <button id="inviteConferenceBtn" class="button" type="button" hidden>
+                Пригласить выбранных
+              </button>
+              <div class="row conference-join">
+                <input
+                  id="conferenceIdInput"
+                  placeholder="ID конференции"
+                  spellcheck="false"
+                />
+                <button id="joinConferenceBtn" class="button" type="button">Войти</button>
+              </div>
+              <p class="hint">
+                Отметьте пользователей в списке выше и создайте комнату. Участники
+                получат приглашение.
+              </p>
+            </div>
+          </section>
+
           <section class="panel panel--history">
             <div class="panel__head">
               <h2>История звонков</h2>
@@ -187,8 +222,9 @@
             <div class="stage-orb" aria-hidden="true"></div>
             <h2>Готовы к звонку</h2>
             <p>
-              Найдите пользователя в панели слева или примите входящий звонок.
-              Для теста откройте второе окно браузера с другим аккаунтом.
+              Найдите пользователя в панели слева, примите входящий звонок или
+              создайте конференцию из отмеченных пользователей. Для теста откройте
+              несколько окон браузера с разными аккаунтами.
             </p>
             <button id="localPreviewBtn" class="button" type="button">
               Проверить камеру и микрофон
@@ -209,6 +245,8 @@
               </div>
               <div id="callTimer" class="call-timer">00:00</div>
             </div>
+
+            <div id="conferenceGrid" class="conference-grid" hidden></div>
 
             <div id="videoGrid" class="video-grid">
               <div class="video-tile video-tile--remote">
@@ -236,6 +274,9 @@
                   Микрофон
                 </button>
                 <button id="cameraBtn" class="button control" type="button">Камера</button>
+                <button id="endForAllBtn" class="button control" type="button" hidden>
+                  Завершить для всех
+                </button>
                 <button id="hangupBtn" class="button control control--danger" type="button">
                   Завершить
                 </button>

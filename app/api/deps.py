@@ -4,6 +4,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.auth import AuthError, UserIdentity
+from app.realtime.conferences import ConferenceRegistry
 from app.realtime.connections import ConnectionManager
 from app.realtime.coordinator import CallCoordinator
 from app.realtime.registry import CallRegistry
@@ -34,6 +35,10 @@ def get_connections(request: Request) -> ConnectionManager:
 
 def get_registry(request: Request) -> CallRegistry:
     return request.app.state.registry
+
+
+def get_conferences(request: Request) -> ConferenceRegistry:
+    return request.app.state.conferences
 
 
 def get_coordinator(request: Request) -> CallCoordinator:

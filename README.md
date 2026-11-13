@@ -1,9 +1,9 @@
 # xam_call_service
 
 Сервис аудио- и видеозвонков для мессенджера **xam**: сигналинг, присутствие,
-история звонков и небольшой WebRTC-клиент для проверки связи. Авторизация
-выполняется токенами соседнего `xam_backend` (OAuth2 bearer / JWT), медиа идёт
-напрямую между браузерами.
+история звонков, конференции «многие ко многим» и небольшой WebRTC-клиент для
+проверки связи. Авторизация выполняется токенами соседнего `xam_backend`
+(OAuth2 bearer / JWT), медиа идёт напрямую между браузерами.
 
 ## Что реализовано
 
@@ -17,6 +17,9 @@
 - **1:1 аудио- и видеозвонки**: приглашение, принятие, отклонение, отмена,
   завершение, таймаут, максимальная длительность, восстановление после
   короткого обрыва WebSocket.
+- **Конференции «многие ко многим»**: комната на N участников (по умолчанию до
+  8), приглашения, вход/выход, передача роли хоста, приглашение новых
+  участников из комнаты и полносвязная WebRTC-сеть (full mesh).
 - **WebRTC-сигналинг через WebSocket**: SDP offer/answer и ICE-кандидаты
   пересылаются только участникам звонка; сервер валидирует и санитизирует данные.
 - **Presence**: подписка на выбранных пользователей, статусы `online` и `in_call`.
@@ -33,25 +36,30 @@
 ```mermaid
 flowchart LR
     A[Браузер A<br/>xam/calls client] <-- WebRTC media<br/>SRTP/DTLS/UDP --> B[Браузер B<br/>xam/calls client]
-    A <-- WebSocket signaling<br/>SDP / ICE / call state --> C[xam_call_service]
-    B <-- WebSocket signaling --> C
-    C -- JWT validation / userinfo / search --> D[xam_backend<br/>FastAPI + PostgreSQL]
-    A -- login / search proxy --> C
-    C --> E[(SQLite<br/>call history)]
+    A <-- WebRTC media --> C2[Браузер C<br/>конференция]
+    B <-- WebRTC media --> C2
+    A <-- WebSocket signaling<br/>SDP / ICE / call state --> S[xam_call_service]
+    B <-- WebSocket signaling --> S
+    C2 <-- WebSocket signaling --> S
+    S -- JWT validation / userinfo / search --> D[xam_backend<br/>FastAPI + PostgreSQL]
+    A -- login / search proxy --> S
+    S --> E[(SQLite<br/>call history)]
 ```
 
 Почему так:
 
-- **Медиа не идёт через Python-сокеты.** Для 1:1 звонков WebRTC передаёт
-  аудио/видео напрямую по SRTP/DTLS поверх UDP с аппаратными кодеками,
-  эхо-подавлением и адаптацией битрейта. Сервер только сигнализирует.
+- **Медиа не идёт через Python-сокеты.** WebRTC передаёт аудио/видео напрямую
+  по SRTP/DTLS поверх UDP с аппаратными кодеками, эхо-подавлением и адаптацией
+  битрейта. Сервер только сигнализирует.
 - **WebSocket** выбран для сигналинга: он уже используется в `xam_backend`,
   работает через тот же nginx/Vite-прокси и поддерживает мгновенную доставку
   событий.
 - Для звонков через NAT нужен **TURN** (см. `TURN_URLS`), иначе часть соединений
   не установится. Docker Compose поднимает coturn, который работает и как STUN.
-- Групповые звонки потребуют SFU (например, LiveKit или mediasoup): текущая
-  версия — только 1:1.
+- **Конференция — full mesh**: каждый участник устанавливает отдельное
+  `RTCPeerConnection` с каждым другим. Это не требует SFU и работает на текущем
+  сигналинге, но исходящий трафик и CPU растут как O(N²). Для больших комнат
+  (обычно больше 8–12 человек) нужен SFU (LiveKit, mediasoup и т.п.).
 
 ## Интеграция с соседним сервисом
 
@@ -141,7 +149,10 @@ uvicorn main:app --reload --port 8081
 2. Зарегистрируйте двух пользователей или войдите существующими.
 3. Найдите второго по username.
 4. Нажмите «Видео» или «Аудио», во втором окне примите звонок.
-5. Разрешите браузеру доступ к камере/микрофону.
+5. Для конференции отметьте чекбоксы у нескольких пользователей в результатах
+   поиска, задайте название и нажмите «Аудио» или «Видео». В других окнах
+   примите приглашение — каждый участник увидит сетку собеседников.
+6. Разрешите браузеру доступ к камере/микрофону.
 
 > Камера и микрофон доступны только в secure context: `localhost` или HTTPS.
 > При открытии по IP без HTTPS браузер заблокирует `getUserMedia`.
@@ -173,7 +184,8 @@ Hash не уходит на сервер, а клиент сразу очища�
 | `GET` | `/api/v1/calls/config` | ICE-серверы и таймауты |
 | `POST` | `/api/v1/calls/ws-ticket` | Одноразовый тикет для WebSocket |
 | `GET` | `/api/v1/calls/history?limit=&offset=` | История звонков |
-| `GET` | `/api/v1/calls/active` | Текущий звонок или `null` |
+| `GET` | `/api/v1/calls/active` | Текущий 1:1 звонок или `null` |
+| `GET` | `/api/v1/calls/conference` | Текущая конференция (включая приглашение) или `null` |
 | `GET` | `/api/v1/calls/{call_id}` | Детали активного/завершённого звонка |
 
 Пример ответа `/calls/config`:
@@ -184,6 +196,7 @@ Hash не уходит на сервер, а клиент сразу очища�
   "ring_timeout_seconds": 45,
   "disconnect_grace_seconds": 10,
   "max_call_duration_seconds": 14400,
+  "max_conference_participants": 8,
   "media": ["audio", "video"]
 }
 ```
@@ -213,9 +226,17 @@ fallback `?token=<jwt>`, но тикет предпочтительнее: acces
 | `call.reject` | `{ "call_id": "uuid" }` | Отклонить входящий |
 | `call.cancel` | `{ "call_id": "uuid" }` | Отменить исходящий до ответа |
 | `call.hangup` | `{ "call_id": "uuid" }` | Завершить звонок |
-| `webrtc.offer` | `{ "call_id": "uuid", "sdp": "..." }` | SDP offer |
-| `webrtc.answer` | `{ "call_id": "uuid", "sdp": "..." }` | SDP answer |
-| `webrtc.ice` | `{ "call_id": "uuid", "candidate": {...}\|null }` | ICE-кандидат |
+| `conference.create` | `{ "media": "audio"\|"video", "title"?: "...", "invitee_ids"?: [...] }` | Создать комнату (создатель сразу внутри) |
+| `conference.join` | `{ "conference_id": "uuid" }` | Войти по приглашению |
+| `conference.decline` | `{ "conference_id": "uuid" }` | Отклонить приглашение |
+| `conference.leave` | `{ "conference_id": "uuid" }` | Выйти из комнаты |
+| `conference.invite` | `{ "conference_id": "uuid", "user_ids": [...] }` | Пригласить участников |
+| `conference.end` | `{ "conference_id": "uuid" }` | Завершить комнату (только хост) |
+| `conference.resync` | `{ "conference_id": "uuid", "renegotiate": true\|false }` | Сообщить о переподключении; `renegotiate` просит пересоздать peer connection |
+| `conference.renegotiate` | `{ "conference_id": "uuid", "to_user_id": "uuid" }` | Попросить назначенного оферента пересоздать соединение |
+| `webrtc.offer` | `{ "call_id": "uuid", "sdp": "..." }` или `{ "conference_id": "uuid", "to_user_id": "uuid", "sdp": "..." }` | SDP offer |
+| `webrtc.answer` | `{ "call_id": "uuid", "sdp": "..." }` или `{ "conference_id": "uuid", "to_user_id": "uuid", "sdp": "..." }` | SDP answer |
+| `webrtc.ice` | `{ "call_id": "uuid", "candidate": {...}\|null }` или `{ "conference_id": "uuid", "to_user_id": "uuid", "candidate": {...}\|null }` | ICE-кандидат |
 
 ### Сервер → клиент
 
@@ -230,9 +251,17 @@ fallback `?token=<jwt>`, но тикет предпочтительнее: acces
 | `call.rejected` | `{ call }` | Звонок отклонён |
 | `call.cancelled` | `{ call }` | Звонок отменён звонящим |
 | `call.ended` | `{ call }` | Завершён: `hangup`, `timeout`, `disconnected`, `max_duration`, `server_shutdown` |
-| `webrtc.offer` | `{ call_id, from_user_id, sdp }` | Offer от собеседника |
-| `webrtc.answer` | `{ call_id, from_user_id, sdp }` | Answer от собеседника |
-| `webrtc.ice` | `{ call_id, from_user_id, candidate }` | ICE-кандидат |
+| `conference.created` | `{ conference }` | Комната создана; создатель уже в ней |
+| `conference.invited` | `{ conference, invited_by }` | Приглашение в комнату |
+| `conference.joined` | `{ conference, participant }` | Участник вошёл (событие получают все в комнате) |
+| `conference.left` | `{ conference, participant }` | Участник вышел |
+| `conference.declined` | `{ conference, participant }` | Приглашение отклонено |
+| `conference.reconnected` | `{ conference, participant, renegotiate }` | Участник переподключился; при `renegotiate: true` нужно пересоздать с ним peer connection |
+| `conference.renegotiate` | `{ conference_id, from_user_id, to_user_id }` | Встречный запрос на пересоздание соединения |
+| `conference.ended` | `{ conference }` | Комната закрыта: `ended`, `left`, `server_shutdown` |
+| `webrtc.offer` | `{ call_id, from_user_id, sdp }` или `{ conference_id, from_user_id, to_user_id, sdp }` | Offer |
+| `webrtc.answer` | `{ call_id, from_user_id, sdp }` или `{ conference_id, from_user_id, to_user_id, sdp }` | Answer |
+| `webrtc.ice` | `{ call_id, from_user_id, candidate }` или `{ conference_id, from_user_id, to_user_id, candidate }` | ICE-кандидат |
 | `error` | `{ code, detail }` | Ошибка сигналинга |
 
 Объект звонка:
@@ -253,10 +282,34 @@ fallback `?token=<jwt>`, но тикет предпочтительнее: acces
 }
 ```
 
+Объект конференции:
+
+```json
+{
+  "id": "uuid",
+  "kind": "conference",
+  "host_id": "uuid",
+  "title": "Team sync",
+  "media": "video",
+  "state": "active",
+  "status": "active",
+  "end_reason": null,
+  "created_at": "2026-11-10T12:00:00+00:00",
+  "ended_at": null,
+  "max_participants": 8,
+  "participants": [
+    { "user": { "id": "uuid", "username": "alice", "display_name": "Alice" }, "state": "joined", "joined_at": "2026-11-10T12:00:00+00:00" },
+    { "user": { "id": "uuid", "username": "bob", "display_name": "Bob" }, "state": "invited", "joined_at": null }
+  ],
+  "joined_ids": ["uuid"]
+}
+```
+
 Коды ошибок: `invalid_json`, `invalid_event`, `invalid_payload`, `unknown_event`,
 `user_offline`, `self_call`, `caller_busy`, `callee_busy`, `call_not_found`,
-`forbidden`, `invalid_state`, `rate_limited`, `payload_too_large`,
-`internal_error`.
+`conference_not_found`, `conference_full`, `not_joined`,
+`already_in_conference`, `invalid_media`, `forbidden`, `invalid_state`,
+`rate_limited`, `payload_too_large`, `internal_error`.
 
 ### Поведение звонка
 
@@ -271,6 +324,27 @@ fallback `?token=<jwt>`, но тикет предпочтительнее: acces
 - Если получатель сигнала временно offline, до 200 последних сигналов
   буферизуются и отправляются после переподключения.
 
+### Поведение конференции
+
+- Один пользователь не может одновременно быть в 1:1 звонке и в конференции.
+  Приглашённые, но ещё не вошедшие участники не считаются занятыми.
+- Размер комнаты ограничен `MAX_CONFERENCE_PARTICIPANTS` (по умолчанию 8).
+- Создатель сразу входит в комнату и является хостом. При выходе хоста роль
+  переходит самому раннему из оставшихся участников; если никого не осталось,
+  комната закрывается.
+- Войти можно только по приглашению (`conference.invited`) и только пока
+  комната активна. `conference.end` доступен только хосту.
+- Медиа-соединения строятся по схеме full mesh. Оффер для каждой пары
+  инициирует участник с меньшим UUID; остальные ждут оффер. После
+  переподключения клиент пересоздаёт только нездоровые peer connections
+  (`conference.reconnected`, `conference.resync`, `conference.renegotiate`).
+- Выход по `conference.leave` и обрыв WebSocket удаляют участника из комнаты
+  через `DISCONNECT_GRACE_SECONDS`. Комната продолжает работать без него.
+- `MAX_CALL_DURATION_SECONDS` и `RING_TIMEOUT_SECONDS` применяются только к 1:1
+  звонкам; комната живёт, пока в ней есть участники.
+- История конференций пока не сохраняется в SQLite: в истории остаются только
+  1:1 звонки.
+
 ## Клиент для теста
 
 `app/static` — статический клиент без npm и сборки. Он умеет:
@@ -278,6 +352,10 @@ fallback `?token=<jwt>`, но тикет предпочтительнее: acces
 - входить по логину/паролю через прокси, регистрироваться или подключаться по JWT;
 - искать пользователей, видеть `online`/`in_call` и звонить по username или UUID;
 - принимать/отклонять входящие, звонить аудио/видео;
+- создавать конференцию из отмеченных пользователей, принимать приглашения,
+  входить по ID комнаты, приглашать новых участников и выходить из комнаты;
+- показывать сетку участников конференции (full mesh) и статус каждого
+  peer connection;
 - показывать локальный и удалённый поток, таймер, битрейт/разрешение/ fps;
 - переключать микрофон и камеру;
 - вести журнал сигналинга и диагностику WebRTC (ICE-серверы, типы кандидатов
@@ -347,7 +425,7 @@ docker compose cp calls-tls:/etc/nginx/certs/server.crt ./server.crt
 ### STUN/TURN
 
 Compose поднимает `turn` (coturn 4.6.3): STUN и TURN на `3478/udp`, `3478/tcp`,
-relay-порты `49160-49200/udp`. Клиент получает адреса из `/api/v1/calls/config`,
+relay-порты `49160-49300/udp`. Клиент получает адреса из `/api/v1/calls/config`,
 поэтому TURN-доступ задаётся в `.env` один раз:
 
 ```bash
@@ -358,12 +436,12 @@ TURN_CREDENTIAL=change-me
 TURN_REALM=xam
 TURN_EXTERNAL_IP=192.168.1.50
 TURN_MIN_PORT=49160
-TURN_MAX_PORT=49200
+TURN_MAX_PORT=49300
 ```
 
 `TURN_EXTERNAL_IP` — адрес, который видят браузеры. Для звонков внутри LAN это
 IP хоста. Для звонков через интернет — публичный IP, при этом на роутере нужно
-пробросить `3478/tcp`, `3478/udp` и диапазон `49160-49200/udp` на хост с Docker,
+пробросить `3478/tcp`, `3478/udp` и диапазон `49160-49300/udp` на хост с Docker,
 а `TURN_EXTERNAL_IP` должен совпадать с публичным адресом. Если сервер за NAT,
 используйте формат `PUBLIC_IP/PRIVATE_IP`.
 
@@ -428,6 +506,7 @@ docker run --rm -p 8081:8081 \
 | `RING_TIMEOUT_SECONDS` | `45` | Таймаут приглашения |
 | `DISCONNECT_GRACE_SECONDS` | `10` | Окно переподключения WS |
 | `MAX_CALL_DURATION_SECONDS` | `14400` | Лимит звонка, `0` — без лимита |
+| `MAX_CONFERENCE_PARTICIPANTS` | `8` | Максимум участников full-mesh конференции |
 | `WS_TICKET_TTL_SECONDS` | `30` | Время жизни WS-тикета |
 | `MAX_WS_MESSAGE_BYTES` | `98304` | Максимальный размер WS-сообщения |
 | `WS_IDLE_TIMEOUT_SECONDS` | `180` | Закрывать сокет без входящих сообщений; `0` — не закрывать |
@@ -437,7 +516,7 @@ docker run --rm -p 8081:8081 \
 | `TURN_USERNAME` / `TURN_CREDENTIAL` | — | TURN-доступ (static long-term credentials) |
 | `TURN_REALM` | `xam` | Realm coturn для long-term credentials |
 | `TURN_EXTERNAL_IP` | `127.0.0.1` | Адрес relay-кандидатов: LAN IP, публичный IP или `PUBLIC/PRIVATE` |
-| `TURN_MIN_PORT` / `TURN_MAX_PORT` | `49160` / `49200` | Диапазон relay-портов UDP |
+| `TURN_MIN_PORT` / `TURN_MAX_PORT` | `49160` / `49300` | Диапазон relay-портов UDP |
 | `CORS_ORIGINS` | localhost-порты | Разрешённые origin через запятую |
 | `CALLS_PORT` | `8081` | Хост-порт HTTP |
 | `CALLS_TLS_PORT` | `8443` | Хост-порт HTTPS |
@@ -458,16 +537,22 @@ docker run --rm -p 8081:8081 \
 REST-авторизация, одноразовые WS-тикеты, полный сценарий invite → accept →
 offer → answer → ICE → hangup, reject/cancel, таймаут, busy/offline/self-call,
 запрет сигналов третьим лицам, presence, обрыв соединения, история, прокси
-`xam_backend`, конфигурация ICE.
+`xam_backend`, конфигурация ICE. Для конференций: создание и приглашения,
+вход/выход/отклонение, host-only завершение, лимит участников, занятость,
+маршрутизация SDP/ICE конкретному участнику, запрет сигналов чужим, восстановление
+приглашения через `ready`, disconnect и перевод роли хоста.
 
 Тесты используют временную SQLite и не требуют запущенного `xam_backend`
 (интеграция с ним подменяется фейком в тестах прокси).
 
 ## Ограничения и безопасность
 
-- Только **1:1** звонки. Групповые звонки, запись, screen share и E2EE-специфика
-  вне текущего объёма; для групп нужен SFU.
-- Состояние звонков, presence и WS-тикеты хранятся **в памяти процесса**.
+- Конференции работают по **full mesh**: каждый участник шлёт медиа каждому.
+  Это ограничивает комнату 8–12 людьми. Для больших групп, записи, screen share
+  и E2EE-специфики нужен SFU.
+- История конференций не сохраняется; SQLite хранит только 1:1 звонки.
+- Состояние звонков, конференций, presence и WS-тикеты хранятся **в памяти
+  процесса**.
   Несколько воркеров/реплик потребуют Redis pub/sub и sticky sessions либо
   отдельного signaling-слоя. SQLite также не рассчитан на несколько инстансов.
 - TURN-креденшелы в конфиге статичны. Для продакшена используйте эфемерные
@@ -492,7 +577,7 @@ app/
   core/            # config, JWT/OAuth2 validation, errors
   db/              # async engine/session
   models/          # call ORM model
-  realtime/        # connections, call registry, coordinator, tickets, events
+  realtime/        # connections, call/conference registries, coordinator, tickets, events
   repositories/    # call history queries
   schemas/         # Pydantic API schemas
   services/        # xam_backend client, user directory, history
@@ -508,7 +593,9 @@ tests/             # pytest: auth, registry, signaling, proxy
 | `401` на всех запросах | Ключ JWT, срок действия токена, `AUTH_MODE` |
 | «Пользователь не в сети» | Второй пользователь не подключил WS или не открыл клиент |
 | Нет видео/звука, но звонок «в эфире» | NAT: нужен TURN (`TURN_URLS`), проверьте `chrome://webrtc-internals` |
-| «WebRTC не установил соединение» | В диагностике клиента: `ICE-серверы` и `ICE-кандидаты` (`relay 0` — TURN недоступен). Проверьте `TURN_EXTERNAL_IP`, порты `3478` и `49160-49200`, firewall и креды |
+| «WebRTC не установил соединение» | В диагностике клиента: `ICE-серверы` и `ICE-кандидаты` (`relay 0` — TURN недоступен). Проверьте `TURN_EXTERNAL_IP`, порты `3478` и `49160-49300`, firewall и креды |
+| В конференции часть участников не видит/не слышит друг друга | Full mesh требует соединения каждой пары: проверьте `Peer connections` в диагностике, TURN и лимит `MAX_CONFERENCE_PARTICIPANTS`. Для больших комнат нужен SFU |
+| «В конференции уже нет свободных мест» | Лимит задаётся в `MAX_CONFERENCE_PARTICIPANTS` при старте и копируется в комнату при создании. Изменение переменной требует перезапуска (он завершает активные комнаты) и действует только на новые комнаты. Приглашённые, но не вошедшие участники занимают место — завершите комнату и создайте новую |
 | STUN не отвечает | `docker logs xam_call_service-turn-1`; `TURN_EXTERNAL_IP` не должен быть адресом контейнера `172.x` для внешних клиентов |
 | Браузер не даёт камеру | Открывайте `localhost` или HTTPS, разрешите доступ |
 | `Auth service is unavailable` | `xam_backend` не запущен или неверный `BACKEND_BASE_URL` |

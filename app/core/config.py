@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     ring_timeout_seconds: int = 45
     disconnect_grace_seconds: int = 10
     max_call_duration_seconds: int = 4 * 60 * 60
+    max_conference_participants: int = Field(default=8, ge=2, le=12)
     ws_ticket_ttl_seconds: int = 30
     max_ws_message_bytes: int = 96 * 1024
     ws_idle_timeout_seconds: int = 180

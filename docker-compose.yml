@@ -27,6 +27,7 @@ services:
       RING_TIMEOUT_SECONDS: ${RING_TIMEOUT_SECONDS:-45}
       DISCONNECT_GRACE_SECONDS: ${DISCONNECT_GRACE_SECONDS:-10}
       MAX_CALL_DURATION_SECONDS: ${MAX_CALL_DURATION_SECONDS:-14400}
+      MAX_CONFERENCE_PARTICIPANTS: ${MAX_CONFERENCE_PARTICIPANTS:-8}
       WS_TICKET_TTL_SECONDS: ${WS_TICKET_TTL_SECONDS:-30}
       MAX_WS_MESSAGE_BYTES: ${MAX_WS_MESSAGE_BYTES:-98304}
       WS_IDLE_TIMEOUT_SECONDS: ${WS_IDLE_TIMEOUT_SECONDS:-180}
@@ -73,7 +74,7 @@ services:
       - --user=${TURN_USERNAME:-xam}:${TURN_CREDENTIAL:-xam-turn-change-me}
       - --external-ip=${TURN_EXTERNAL_IP:-127.0.0.1}
       - --min-port=${TURN_MIN_PORT:-49160}
-      - --max-port=${TURN_MAX_PORT:-49200}
+      - --max-port=${TURN_MAX_PORT:-49300}
       - --no-tls
       - --no-dtls
       - --no-cli
@@ -83,7 +84,7 @@ services:
     ports:
       - "3478:3478/tcp"
       - "3478:3478/udp"
-      - "${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
+      - "${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49300}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49300}/udp"
     restart: unless-stopped
 
   # Same service behind HTTPS with a self-signed certificate (for camera/mic

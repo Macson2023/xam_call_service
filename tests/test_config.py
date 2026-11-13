@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from app.core.config import Settings
 
 
@@ -18,6 +21,16 @@ def test_turn_is_appended_to_ice_servers() -> None:
             "credential": "secret",
         },
     ]
+
+
+def test_conference_participant_limit_is_bounded() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_conference_participants=1)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_conference_participants=13)
+    assert (
+        Settings(_env_file=None, max_conference_participants=12).max_conference_participants == 12
+    )
 
 
 def test_turn_urls_string_is_split_on_commas() -> None:

@@ -36,6 +36,13 @@ const state = {
   direction: null,
   peer: null,
   cancelRequested: false,
+  conference: null,
+  incomingConference: null,
+  conferencePreparing: false,
+  conferenceRestoring: false,
+  conferencePeers: new Map(),
+  pendingConferenceSignals: [],
+  selectedInvitees: new Set(),
   pc: null,
   localStream: null,
   remoteStream: null,
@@ -62,6 +69,11 @@ const ERROR_TEXT = {
   caller_busy: 'Вы уже участвуете в звонке',
   callee_busy: 'Пользователь уже участвует в звонке',
   call_not_found: 'Звонок не найден',
+  conference_not_found: 'Конференция не найдена',
+  conference_full: 'В конференции уже нет свободных мест',
+  not_joined: 'Сначала войдите в конференцию',
+  already_in_conference: 'Вы уже участвуете в звонке или конференции',
+  invalid_media: 'Некорректный тип медиа',
   forbidden: 'Нет доступа к этому звонку',
   invalid_state: 'Действие недоступно в текущем состоянии звонка',
   rate_limited: 'Слишком много событий, попробуйте ещё раз',
@@ -76,6 +88,8 @@ const END_REASON_TEXT = {
   cancelled: 'Звонок отменён',
   disconnected: 'Соединение потеряно',
   max_duration: 'Достигнут лимит времени звонка',
+  ended: 'Конференция завершена',
+  left: 'Вы вышли из конференции',
   server_shutdown: 'Сервер завершил звонок',
 };
 
@@ -330,6 +344,7 @@ function showApp() {
   state.wsAttempts = 0;
   state.hasConnectedOnce = false;
   state.serverWatched = new Set();
+  updateSelectionUi();
 }
 
 function applyAuthResponse(response) {
@@ -372,7 +387,9 @@ function clearSession(message) {
   state.wsManualClose = true;
   detachSocket();
   stopQuickPreview();
+  cleanupConference(null, { refresh: false });
   cleanupCall(null, { refresh: false });
+  state.selectedInvitees.clear();
   state.token = null;
   state.me = null;
   state.config = null;
@@ -387,6 +404,7 @@ function clearSession(message) {
   $('searchInput').value = '';
   $('searchResults').innerHTML = '<p class="empty">Введите username, чтобы найти собеседника.</p>';
   $('historyList').innerHTML = '<p class="empty">Пока нет звонков.</p>';
+  updateSelectionUi();
   showLogin(message);
 }
 
@@ -724,6 +742,11 @@ function desiredWatchIds() {
   if (state.peer?.id) {
     ids.add(state.peer.id);
   }
+  (state.conference?.joined_ids || []).forEach((id) => {
+    if (id) {
+      ids.add(id);
+    }
+  });
   if (state.me?.id) {
     ids.delete(state.me.id);
   }
@@ -787,12 +810,17 @@ function handleReady(data) {
       ...(state.config || {}),
       ring_timeout_seconds: data.ring_timeout_seconds,
       disconnect_grace_seconds: data.disconnect_grace_seconds,
+      max_conference_participants: data.max_conference_participants,
       media: data.media,
     };
   }
 
   const serverCall = data.call || null;
+  const serverConference = data.conference || null;
   if (serverCall) {
+    if (state.conference || state.incomingConference || state.conferencePreparing) {
+      cleanupConference(null, { refresh: false });
+    }
     const direction = serverCall.caller.id === state.me?.id ? 'outgoing' : 'incoming';
     const peer = direction === 'outgoing' ? serverCall.callee : serverCall.caller;
 
@@ -829,8 +857,22 @@ function handleReady(data) {
         endStaleCall(serverCall, direction);
       }
     }
+  } else if (serverConference) {
+    if (state.call) {
+      cleanupCall(null, { refresh: false });
+    }
+    void restoreConference(serverConference);
   } else if (state.call?.id) {
     cleanupCall('Звонок завершён', { refresh: true });
+  }
+
+  if (!serverCall && !serverConference) {
+    const hadConference = Boolean(state.conference || state.incomingConference);
+    if (hadConference || state.conferencePreparing) {
+      cleanupConference(hadConference ? 'Конференция завершена' : null, {
+        refresh: hadConference,
+      });
+    }
   }
 
   state.hasConnectedOnce = true;
@@ -854,6 +896,10 @@ function handleServerError(data) {
   const message = ERROR_TEXT[code] || data?.detail || 'Ошибка сигналинга';
   toast(message, 'error');
   logEvent('!', code, data);
+  if (state.conferencePreparing) {
+    cleanupConference(null, { refresh: false });
+    return;
+  }
   if (state.call && state.call.state === 'preparing') {
     cleanupCall(null, { refresh: false });
     return;
@@ -908,6 +954,16 @@ async function handleWsEvent(event) {
     case 'call.incoming': {
       const call = event.data?.call;
       if (!call) {
+        return;
+      }
+      if (state.conference) {
+        logEvent('!', 'incoming-while-conference', { call_id: call.id });
+        sendRaw({ type: 'call.reject', data: { call_id: call.id } });
+        return;
+      }
+      if (state.incomingConference || state.conferencePreparing) {
+        logEvent('!', 'incoming-while-conference-invite', { call_id: call.id });
+        sendRaw({ type: 'call.reject', data: { call_id: call.id } });
         return;
       }
       if (state.call && state.call.id !== call.id) {
@@ -972,8 +1028,44 @@ async function handleWsEvent(event) {
       return;
     }
 
+    case 'conference.created':
+      handleConferenceCreated(event.data || {});
+      return;
+
+    case 'conference.invited':
+      handleConferenceInvited(event.data || {});
+      return;
+
+    case 'conference.joined':
+      handleConferenceJoined(event.data || {});
+      return;
+
+    case 'conference.left':
+      handleConferenceLeft(event.data || {});
+      return;
+
+    case 'conference.reconnected':
+      handleConferenceReconnected(event.data || {});
+      return;
+
+    case 'conference.renegotiate':
+      handleConferenceRenegotiate(event.data || {});
+      return;
+
+    case 'conference.declined':
+      handleConferenceDeclined(event.data || {});
+      return;
+
+    case 'conference.ended':
+      handleConferenceEnded(event.data || {});
+      return;
+
     case 'webrtc.offer': {
       const data = event.data || {};
+      if (data.conference_id) {
+        await handleConferenceSignal('webrtc.offer', data);
+        return;
+      }
       if (!state.call || data.call_id !== state.call.id) {
         return;
       }
@@ -983,6 +1075,10 @@ async function handleWsEvent(event) {
 
     case 'webrtc.answer': {
       const data = event.data || {};
+      if (data.conference_id) {
+        await handleConferenceSignal('webrtc.answer', data);
+        return;
+      }
       if (!state.call || data.call_id !== state.call.id) {
         return;
       }
@@ -992,6 +1088,10 @@ async function handleWsEvent(event) {
 
     case 'webrtc.ice': {
       const data = event.data || {};
+      if (data.conference_id) {
+        await handleConferenceSignal('webrtc.ice', data);
+        return;
+      }
       if (!state.call || data.call_id !== state.call.id) {
         return;
       }
@@ -1012,7 +1112,95 @@ function setCallStatus(text) {
   $('callStatus').textContent = text;
 }
 
+function conferenceParticipant(userId) {
+  return (state.conference?.participants || []).find(
+    (participant) => participant.user?.id === userId,
+  );
+}
+
+function conferenceUser(userId) {
+  return conferenceParticipant(userId)?.user || { id: userId };
+}
+
+function conferenceIsHost() {
+  return Boolean(state.conference && state.me && state.conference.host_id === state.me.id);
+}
+
+function conferenceTitle(conference = state.conference) {
+  if (!conference) {
+    return 'Конференция';
+  }
+  return conference.title || `Конференция ${shortId(conference.id)}`;
+}
+
+function conferenceStartTime(conference) {
+  const self = (conference?.participants || []).find(
+    (participant) => participant.user?.id === state.me?.id,
+  );
+  return self?.joined_at || conference?.created_at;
+}
+
+function tileHasVideo(stream) {
+  const track = stream?.getVideoTracks?.()[0];
+  return Boolean(track && track.readyState === 'live' && track.enabled);
+}
+
+function updateConferencePlaceholders() {
+  const grid = $('conferenceGrid');
+  if (!grid) {
+    return;
+  }
+  grid.querySelectorAll('[data-conf-peer]').forEach((tile) => {
+    const peerId = tile.dataset.confPeer;
+    const isSelf = peerId === state.me?.id;
+    const entry = state.conferencePeers.get(peerId);
+    const stream = isSelf ? state.localStream : entry?.remoteStream;
+    const placeholder = tile.querySelector('.conf-placeholder');
+    if (placeholder) {
+      placeholder.hidden = tileHasVideo(stream);
+    }
+  });
+}
+
+function updateConferenceUi() {
+  const conference = state.conference;
+  if (!conference) {
+    return;
+  }
+  const meId = state.me?.id;
+  const joined = conference.joined_ids || [];
+  const others = joined.filter((id) => id !== meId);
+  const connected = [...state.conferencePeers.values()].filter(
+    (entry) => entry.pc.connectionState === 'connected',
+  ).length;
+
+  $('callPeer').textContent = conferenceTitle();
+  if (!others.length) {
+    $('callStatus').textContent = 'Ожидание участников';
+  } else if (connected) {
+    $('callStatus').textContent = `В эфире · ${joined.length} участников`;
+  } else {
+    $('callStatus').textContent = `Соединяем · ${joined.length} участников`;
+  }
+  $('callStats').textContent = others.length
+    ? `WebRTC: соединено ${connected} из ${others.length}`
+    : 'WebRTC: подключений пока нет';
+
+  $('conferenceGrid').classList.toggle('audio-only', conference.media === 'audio');
+  $('cameraBtn').hidden = conference.media !== 'video';
+  $('hangupBtn').textContent = 'Выйти';
+  $('endForAllBtn').hidden = !conferenceIsHost();
+
+  updateMediaButtons();
+  updateConferencePlaceholders();
+  updateDiag();
+}
+
 function updateCallUi() {
+  if (state.conference) {
+    updateConferenceUi();
+    return;
+  }
   const call = state.call;
   if (!call) {
     return;
@@ -1084,7 +1272,19 @@ function updateMediaButtons() {
 function showCallStage() {
   $('previewState').hidden = true;
   $('callStage').hidden = false;
+  $('videoGrid').hidden = false;
+  $('conferenceGrid').hidden = true;
+  $('endForAllBtn').hidden = true;
+  $('hangupBtn').textContent = 'Завершить';
   updateCallUi();
+}
+
+function showConferenceStage() {
+  $('previewState').hidden = true;
+  $('callStage').hidden = false;
+  $('videoGrid').hidden = true;
+  $('conferenceGrid').hidden = false;
+  updateConferenceUi();
 }
 
 function resetCallView() {
@@ -1094,6 +1294,12 @@ function resetCallView() {
   $('callTimer').textContent = '00:00';
   $('callStats').textContent = 'WebRTC: ожидание подключения';
   $('videoGrid').classList.remove('audio-only');
+  $('videoGrid').hidden = false;
+  $('conferenceGrid').hidden = true;
+  $('conferenceGrid').classList.remove('audio-only');
+  $('conferenceGrid').innerHTML = '';
+  $('endForAllBtn').hidden = true;
+  $('hangupBtn').textContent = 'Завершить';
   $('remoteVideo').srcObject = null;
   $('localVideo').srcObject = null;
   $('remotePlaceholder').hidden = false;
@@ -1123,9 +1329,14 @@ function hideIncoming() {
   $('incomingModal').hidden = true;
   $('acceptBtn').disabled = false;
   $('rejectBtn').disabled = false;
+  $('acceptBtn').textContent = 'Принять';
 }
 
 async function acceptIncoming() {
+  if (state.incomingConference) {
+    await acceptConferenceInvite();
+    return;
+  }
   const call = state.call;
   if (!call || state.direction !== 'incoming' || call.state !== 'ringing') {
     return;
@@ -1171,6 +1382,10 @@ async function acceptIncoming() {
 }
 
 function rejectIncoming() {
+  if (state.incomingConference) {
+    declineConferenceInvite();
+    return;
+  }
   const call = state.call;
   if (!call || state.direction !== 'incoming') {
     hideIncoming();
@@ -1181,9 +1396,859 @@ function rejectIncoming() {
   cleanupCall('Звонок отклонён', { refresh: true });
 }
 
+function sendConferenceSignal(type, peerId, extra) {
+  if (!state.conference?.id || !peerId) {
+    return false;
+  }
+  return sendRaw({
+    type,
+    data: {
+      conference_id: state.conference.id,
+      to_user_id: peerId,
+      ...extra,
+    },
+  });
+}
+
+function conferenceShouldOffer(peerId) {
+  const meId = String(state.me?.id || '');
+  return Boolean(meId && peerId && meId < String(peerId));
+}
+
+function conferenceTile(peerId) {
+  return $('conferenceGrid').querySelector(`[data-conf-peer="${peerId}"]`);
+}
+
+function attachConferenceStream(peerId, stream) {
+  const tile = conferenceTile(peerId);
+  if (!tile) {
+    return;
+  }
+  const video = tile.querySelector('video');
+  if (!video) {
+    return;
+  }
+  if (video.srcObject !== stream) {
+    video.srcObject = stream;
+  }
+  void video.play().catch(() => {});
+  const placeholder = tile.querySelector('.conf-placeholder');
+  if (placeholder) {
+    placeholder.hidden = tileHasVideo(stream);
+  }
+}
+
+function createConferenceTile(participantId) {
+  const isSelf = participantId === state.me?.id;
+  const tile = document.createElement('div');
+  tile.className = `conf-tile${isSelf ? ' conf-tile--self' : ''}`;
+  tile.dataset.confPeer = participantId;
+  tile.innerHTML = `
+    <video autoplay playsinline ${isSelf ? 'muted' : ''}></video>
+    <div class="conf-placeholder">
+      <div class="avatar avatar--lg"></div>
+      <span>${isSelf ? 'Вы' : 'Камера выключена'}</span>
+    </div>
+    <div class="conf-label"></div>`;
+  updateConferenceTile(tile, participantId);
+  return tile;
+}
+
+function updateConferenceTile(tile, participantId) {
+  const isSelf = participantId === state.me?.id;
+  const user = conferenceUser(participantId);
+  const avatar = tile.querySelector('.conf-placeholder .avatar');
+  if (avatar) {
+    avatar.textContent = initialsFor(user);
+    avatar.style.setProperty('--avatar', colorFor(user?.id || participantId));
+  }
+  const label = tile.querySelector('.conf-label');
+  if (label) {
+    label.textContent = `${displayName(user)}${isSelf ? ' · вы' : ''}`;
+  }
+}
+
+function renderConferenceGrid() {
+  const conference = state.conference;
+  const grid = $('conferenceGrid');
+  if (!conference || !grid) {
+    return;
+  }
+  const joined = conference.joined_ids || [];
+  const existing = new Map(
+    [...grid.querySelectorAll('[data-conf-peer]')].map((tile) => [
+      tile.dataset.confPeer,
+      tile,
+    ]),
+  );
+  for (const [participantId, tile] of existing) {
+    if (!joined.includes(participantId)) {
+      tile.remove();
+      existing.delete(participantId);
+    }
+  }
+
+  let cursor = grid.firstElementChild;
+  for (const participantId of joined) {
+    let tile = existing.get(participantId);
+    if (!tile) {
+      tile = createConferenceTile(participantId);
+      existing.set(participantId, tile);
+    } else {
+      updateConferenceTile(tile, participantId);
+    }
+    if (tile !== cursor) {
+      grid.insertBefore(tile, cursor);
+    } else {
+      cursor = cursor.nextElementSibling;
+    }
+  }
+
+  if (state.localStream) {
+    const selfVideo = grid.querySelector(`[data-conf-peer="${state.me?.id}"] video`);
+    if (selfVideo) {
+      selfVideo.srcObject = state.localStream;
+      selfVideo.muted = true;
+      void selfVideo.play().catch(() => {});
+    }
+  }
+  state.conferencePeers.forEach((entry, peerId) => {
+    if (entry.remoteStream) {
+      attachConferenceStream(peerId, entry.remoteStream);
+    }
+  });
+  updateConferencePlaceholders();
+}
+
+function addLocalTracksToConferencePeer(entry) {
+  if (!state.localStream) {
+    return false;
+  }
+  const kinds = new Set(
+    entry.pc
+      .getSenders()
+      .map((sender) => sender.track?.kind)
+      .filter(Boolean),
+  );
+  let added = false;
+  state.localStream.getTracks().forEach((track) => {
+    if (!kinds.has(track.kind)) {
+      entry.pc.addTrack(track, state.localStream);
+      added = true;
+    }
+  });
+  return added;
+}
+
+function createConferencePeer(peerId) {
+  const existing = state.conferencePeers.get(peerId);
+  if (existing) {
+    addLocalTracksToConferencePeer(existing);
+    return existing;
+  }
+  const iceServers =
+    state.config?.ice_servers && state.config.ice_servers.length
+      ? state.config.ice_servers
+      : [{ urls: ['stun:stun.l.google.com:19302'] }];
+  const pc = new RTCPeerConnection({
+    iceServers,
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+  });
+  const entry = {
+    peerId,
+    pc,
+    remoteStream: null,
+    pendingCandidates: [],
+    makingOffer: false,
+    failureRestarts: 0,
+  };
+  state.conferencePeers.set(peerId, entry);
+  addLocalTracksToConferencePeer(entry);
+
+  pc.onicecandidate = (event) => {
+    if (!event.candidate) {
+      return;
+    }
+    const candidate = event.candidate.toJSON();
+    sendConferenceSignal('webrtc.ice', peerId, { candidate });
+  };
+
+  pc.ontrack = (event) => {
+    const stream = event.streams[0] || new MediaStream([event.track]);
+    entry.remoteStream = stream;
+    attachConferenceStream(peerId, stream);
+    updateConferenceUi();
+  };
+
+  pc.onconnectionstatechange = () => {
+    updateConferenceUi();
+    if (pc.connectionState === 'failed') {
+      void recoverConferencePeer(peerId);
+    }
+  };
+  pc.oniceconnectionstatechange = () => {
+    updateConferenceUi();
+    if (pc.iceConnectionState === 'failed') {
+      void recoverConferencePeer(peerId);
+    }
+  };
+  pc.onicegatheringstatechange = () => updateDiag();
+  pc.onsignalingstatechange = () => updateDiag();
+  return entry;
+}
+
+function closeConferencePeer(peerId) {
+  const entry = state.conferencePeers.get(peerId);
+  if (!entry) {
+    return;
+  }
+  state.conferencePeers.delete(peerId);
+  entry.pendingCandidates.length = 0;
+  entry.pc.onicecandidate = null;
+  entry.pc.ontrack = null;
+  entry.pc.onconnectionstatechange = null;
+  entry.pc.oniceconnectionstatechange = null;
+  entry.pc.onicegatheringstatechange = null;
+  entry.pc.onsignalingstatechange = null;
+  try {
+    entry.pc.close();
+  } catch {
+  }
+  const tile = conferenceTile(peerId);
+  if (tile) {
+    tile.remove();
+  }
+}
+
+function recoverConferencePeer(peerId) {
+  const entry = state.conferencePeers.get(peerId);
+  const conference = state.conference;
+  if (!entry || !conference || !conference.joined_ids?.includes(peerId)) {
+    return;
+  }
+  if (entry.failureRestarts >= 2) {
+    logEvent('!', 'conference-peer-failed', { peer_id: peerId });
+    return;
+  }
+  const restarts = entry.failureRestarts + 1;
+  closeConferencePeer(peerId);
+  const fresh = createConferencePeer(peerId);
+  fresh.failureRestarts = restarts;
+  if (conferenceShouldOffer(peerId)) {
+    void makeConferenceOffer(fresh, true);
+  } else {
+    sendConferenceSignal('conference.renegotiate', peerId);
+  }
+  renderConferenceGrid();
+  updateConferenceUi();
+}
+
+function handleConferenceRenegotiate(data) {
+  const conference = state.conference;
+  if (!conference || data.conference_id !== conference.id) {
+    return;
+  }
+  const peerId = data.from_user_id;
+  if (!peerId || !conference.joined_ids?.includes(peerId)) {
+    return;
+  }
+  if (!conferenceShouldOffer(peerId)) {
+    return;
+  }
+  const entry = state.conferencePeers.get(peerId);
+  if (entry && entry.failureRestarts >= 2) {
+    return;
+  }
+  const restarts = (entry?.failureRestarts || 0) + 1;
+  closeConferencePeer(peerId);
+  const fresh = createConferencePeer(peerId);
+  fresh.failureRestarts = restarts;
+  renderConferenceGrid();
+  void makeConferenceOffer(fresh, true);
+}
+
+async function makeConferenceOffer(entry, renegotiate = false) {
+  const conference = state.conference;
+  if (!conference || !conference.joined_ids?.includes(entry.peerId)) {
+    return;
+  }
+  if (entry.makingOffer || entry.pc.signalingState !== 'stable') {
+    return;
+  }
+  if (entry.pc.localDescription && !renegotiate) {
+    return;
+  }
+  entry.makingOffer = true;
+  try {
+    const offer = await entry.pc.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: conference.media === 'video',
+    });
+    await entry.pc.setLocalDescription(offer);
+    if (entry.pc.localDescription?.sdp) {
+      sendConferenceSignal('webrtc.offer', entry.peerId, {
+        sdp: entry.pc.localDescription.sdp,
+      });
+    }
+  } catch (error) {
+    logEvent('!', 'conference-offer-error', { detail: String(error?.message || error) });
+  } finally {
+    entry.makingOffer = false;
+  }
+}
+
+function syncConferencePeers() {
+  const conference = state.conference;
+  if (!conference) {
+    return;
+  }
+  const meId = state.me?.id;
+  const desired = new Set(
+    (conference.joined_ids || []).filter((participantId) => participantId !== meId),
+  );
+  for (const peerId of [...state.conferencePeers.keys()]) {
+    if (!desired.has(peerId)) {
+      closeConferencePeer(peerId);
+    }
+  }
+  for (const peerId of desired) {
+    let entry = state.conferencePeers.get(peerId);
+    let addedTracks = false;
+    if (entry) {
+      addedTracks = addLocalTracksToConferencePeer(entry);
+    } else {
+      entry = createConferencePeer(peerId);
+    }
+    if (conferenceShouldOffer(peerId)) {
+      void makeConferenceOffer(entry, addedTracks);
+    }
+  }
+  renderConferenceGrid();
+  updateConferenceUi();
+}
+
+async function flushConferenceCandidates(entry) {
+  const candidates = entry.pendingCandidates.splice(0);
+  for (const candidate of candidates) {
+    try {
+      await entry.pc.addIceCandidate(candidate);
+    } catch (error) {
+      logEvent('!', 'conference-ice-error', { detail: String(error?.message || error) });
+    }
+  }
+}
+
+async function handleConferenceSignal(type, data) {
+  const conference = state.conference;
+  if (!conference || data.conference_id !== conference.id) {
+    return;
+  }
+  const peerId = data.from_user_id;
+  if (
+    !peerId ||
+    peerId === state.me?.id ||
+    !conference.joined_ids?.includes(peerId)
+  ) {
+    return;
+  }
+  if (state.conferenceRestoring) {
+    if (state.pendingConferenceSignals.length < 200) {
+      state.pendingConferenceSignals.push({ type, data });
+    }
+    return;
+  }
+  let entry = state.conferencePeers.get(peerId);
+  if (
+    entry &&
+    (entry.pc.connectionState === 'failed' || entry.pc.connectionState === 'closed')
+  ) {
+    const restarts = entry.failureRestarts;
+    closeConferencePeer(peerId);
+    entry = createConferencePeer(peerId);
+    entry.failureRestarts = restarts;
+    renderConferenceGrid();
+  }
+  entry = entry || createConferencePeer(peerId);
+  try {
+    if (type === 'webrtc.offer') {
+      if (entry.pc.signalingState !== 'stable') {
+        logEvent('!', 'conference-offer-ignored', { state: entry.pc.signalingState });
+        return;
+      }
+      await entry.pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+      await flushConferenceCandidates(entry);
+      const answer = await entry.pc.createAnswer();
+      await entry.pc.setLocalDescription(answer);
+      sendConferenceSignal('webrtc.answer', peerId, {
+        sdp: entry.pc.localDescription.sdp,
+      });
+    } else if (type === 'webrtc.answer') {
+      if (entry.pc.signalingState !== 'have-local-offer') {
+        logEvent('!', 'conference-answer-ignored', { state: entry.pc.signalingState });
+        return;
+      }
+      await entry.pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+      await flushConferenceCandidates(entry);
+    } else if (type === 'webrtc.ice') {
+      if (!data.candidate) {
+        return;
+      }
+      if (!entry.pc.remoteDescription) {
+        entry.pendingCandidates.push(data.candidate);
+        if (entry.pendingCandidates.length > 100) {
+          entry.pendingCandidates.shift();
+        }
+      } else {
+        await entry.pc.addIceCandidate(data.candidate);
+      }
+    }
+  } catch (error) {
+    logEvent('!', 'conference-signal-error', { detail: String(error?.message || error) });
+  }
+  updateConferenceUi();
+}
+
+async function createConference(media) {
+  if (state.conferencePreparing) {
+    return;
+  }
+  if (state.call || state.conference) {
+    toast('Сначала завершите текущий звонок или конференцию', 'error');
+    return;
+  }
+  if (state.incomingConference) {
+    toast('Сначала примите или отклоните приглашение в конференцию', 'error');
+    return;
+  }
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    toast('Нет соединения с сервером сигналинга', 'error');
+    return;
+  }
+  const inviteeIds = selectedInviteeIds();
+  state.conferencePreparing = true;
+  stopQuickPreview();
+  await ensureIceConfig();
+  if (!state.token) {
+    state.conferencePreparing = false;
+    return;
+  }
+  try {
+    await ensureLocalMedia(media);
+  } catch (error) {
+    state.conferencePreparing = false;
+    toast(mediaErrorText(error), 'error');
+    return;
+  }
+
+  const sent = sendRaw({
+    type: 'conference.create',
+    data: {
+      media,
+      title: $('conferenceTitle').value.trim() || null,
+      invitee_ids: inviteeIds,
+    },
+  });
+  if (!sent) {
+    state.conferencePreparing = false;
+    stopLocalStream();
+    toast('Не удалось отправить приглашение', 'error');
+  }
+}
+
+function handleConferenceCreated(data) {
+  const conference = data.conference;
+  if (!conference) {
+    return;
+  }
+  state.conferencePreparing = false;
+  state.conference = conference;
+  state.incomingConference = null;
+  state.selectedInvitees.clear();
+  $('conferenceTitle').value = '';
+  hideIncoming();
+  showConferenceStage();
+  startCallTimer(conferenceStartTime(conference));
+  syncConferencePeers();
+  syncWatched();
+  updateSelectionUi();
+  updateConferenceUi();
+}
+
+function handleConferenceInvited(data) {
+  const conference = data.conference;
+  if (!conference) {
+    return;
+  }
+  if (state.call || state.conference || state.conferencePreparing) {
+    sendRaw({ type: 'conference.decline', data: { conference_id: conference.id } });
+    return;
+  }
+  if (state.incomingConference && state.incomingConference.id !== conference.id) {
+    sendRaw({ type: 'conference.decline', data: { conference_id: conference.id } });
+    return;
+  }
+  state.incomingConference = conference;
+  showIncomingConference(conference, data.invited_by);
+}
+
+function showIncomingConference(conference, invitedBy) {
+  state.conferencePreparing = false;
+  const hostParticipant = (conference.participants || []).find(
+    (participant) => participant.user?.id === conference.host_id,
+  );
+  const host = hostParticipant?.user || { id: conference.host_id };
+  const joined = (conference.joined_ids || []).length;
+  setAvatar($('incomingAvatar'), invitedBy || host);
+  $('incomingName').textContent = conference.title || 'Конференция';
+  $('incomingMeta').textContent = `${mediaLabel(conference.media)} · ${joined} участн. · ${
+    invitedBy ? `приглашение от ${displayName(invitedBy)}` : `организатор ${displayName(host)}`
+  }`;
+  $('acceptBtn').disabled = false;
+  $('rejectBtn').disabled = false;
+  $('acceptBtn').textContent = 'Войти';
+  $('incomingModal').hidden = false;
+  updateDiag();
+}
+
+function handleConferenceJoined(data) {
+  const conference = data.conference;
+  if (!conference) {
+    return;
+  }
+  state.conferencePreparing = false;
+  state.conference = conference;
+  state.incomingConference = null;
+  hideIncoming();
+  showConferenceStage();
+  startCallTimer(conferenceStartTime(conference));
+  syncConferencePeers();
+  syncWatched();
+  updateSelectionUi();
+  updateConferenceUi();
+}
+
+function handleConferenceLeft(data) {
+  const conference = data.conference;
+  const participantId = data.participant?.user?.id;
+  if (!conference || !state.conference || state.conference.id !== conference.id) {
+    return;
+  }
+  state.conference = conference;
+  if (participantId && participantId !== state.me?.id) {
+    closeConferencePeer(participantId);
+  }
+  syncConferencePeers();
+  syncWatched();
+  updateSelectionUi();
+  updateConferenceUi();
+}
+
+function handleConferenceReconnected(data) {
+  const conference = data.conference;
+  const participantId = data.participant?.user?.id;
+  if (!conference || !state.conference || state.conference.id !== conference.id) {
+    return;
+  }
+  if (!participantId || participantId === state.me?.id) {
+    return;
+  }
+  state.conference = conference;
+  const existing = state.conferencePeers.get(participantId);
+  const unhealthy =
+    !existing ||
+    existing.pc.connectionState === 'failed' ||
+    existing.pc.connectionState === 'closed' ||
+    existing.pc.connectionState === 'disconnected';
+  const renegotiate = Boolean(data.renegotiate);
+
+  if (!renegotiate && !unhealthy) {
+    updateConferenceUi();
+    return;
+  }
+  if (conferenceShouldOffer(participantId)) {
+    if (renegotiate || unhealthy) {
+      closeConferencePeer(participantId);
+      const entry = createConferencePeer(participantId);
+      void makeConferenceOffer(entry, true);
+    }
+  } else if (unhealthy) {
+    recoverConferencePeer(participantId);
+  } else {
+    createConferencePeer(participantId);
+  }
+  syncConferencePeers();
+  updateConferenceUi();
+}
+
+function handleConferenceDeclined(data) {
+  const conference = data.conference;
+  if (!conference || !state.conference || state.conference.id !== conference.id) {
+    return;
+  }
+  state.conference = conference;
+  updateConferenceUi();
+}
+
+function handleConferenceEnded(data) {
+  const conference = data.conference;
+  if (!conference) {
+    return;
+  }
+  const wasCurrent = state.conference?.id === conference.id;
+  const wasInvited = state.incomingConference?.id === conference.id;
+  if (wasInvited) {
+    state.incomingConference = null;
+    state.conferencePreparing = false;
+    stopLocalStream();
+    hideIncoming();
+  }
+  if (wasCurrent) {
+    const reason = conference.end_reason;
+    cleanupConference(
+      reason === 'server_shutdown'
+        ? END_REASON_TEXT.server_shutdown
+        : 'Конференция завершена',
+      { refresh: true },
+    );
+  } else if (wasInvited) {
+    toast('Конференция завершена');
+    updateDiag();
+  }
+}
+
+async function acceptConferenceInvite() {
+  const conference = state.incomingConference;
+  if (!conference || state.conferencePreparing) {
+    return;
+  }
+  $('acceptBtn').disabled = true;
+  $('rejectBtn').disabled = true;
+  await ensureIceConfig();
+  try {
+    await ensureLocalMedia(conference.media);
+  } catch (error) {
+    toast(mediaErrorText(error), 'error');
+    sendRaw({ type: 'conference.decline', data: { conference_id: conference.id } });
+    state.incomingConference = null;
+    hideIncoming();
+    return;
+  }
+  state.conferencePreparing = true;
+  if (
+    !sendRaw({
+      type: 'conference.join',
+      data: { conference_id: conference.id },
+    })
+  ) {
+    state.conferencePreparing = false;
+    stopLocalStream();
+    state.incomingConference = null;
+    hideIncoming();
+    toast('Нет соединения с сервером сигналинга', 'error');
+  }
+}
+
+function declineConferenceInvite() {
+  const conference = state.incomingConference;
+  state.incomingConference = null;
+  state.conferencePreparing = false;
+  hideIncoming();
+  if (conference) {
+    sendRaw({ type: 'conference.decline', data: { conference_id: conference.id } });
+  }
+}
+
+function leaveConference() {
+  const conference = state.conference;
+  if (!conference) {
+    cleanupConference(null, { refresh: false });
+    return;
+  }
+  sendRaw({ type: 'conference.leave', data: { conference_id: conference.id } });
+  cleanupConference('Вы вышли из конференции', { refresh: false });
+}
+
+function endConferenceForAll() {
+  const conference = state.conference;
+  if (!conference || !conferenceIsHost()) {
+    return;
+  }
+  sendRaw({ type: 'conference.end', data: { conference_id: conference.id } });
+  cleanupConference('Конференция завершена', { refresh: false });
+}
+
+function cleanupConference(message, options = {}) {
+  const hadConference = Boolean(state.conference || state.incomingConference);
+  for (const peerId of [...state.conferencePeers.keys()]) {
+    closeConferencePeer(peerId);
+  }
+  state.conference = null;
+  state.incomingConference = null;
+  state.conferencePreparing = false;
+  state.conferenceRestoring = false;
+  state.pendingConferenceSignals = [];
+  hideIncoming();
+  stopCallTimer();
+  stopLocalStream();
+  resetCallView();
+  $('acceptBtn').textContent = 'Принять';
+  if (hadConference) {
+    syncWatched();
+  }
+  updateSelectionUi();
+  if (message) {
+    toast(message);
+  }
+  updateDiag();
+}
+
+async function restoreConference(conference) {
+  const self = (conference.participants || []).find(
+    (participant) => participant.user?.id === state.me?.id,
+  );
+  if (!self) {
+    cleanupConference(null, { refresh: false });
+    return;
+  }
+  if (self.state !== 'joined') {
+    if (state.call || state.conference) {
+      sendRaw({ type: 'conference.decline', data: { conference_id: conference.id } });
+      return;
+    }
+    state.incomingConference = conference;
+    showIncomingConference(conference, null);
+    return;
+  }
+
+  state.conference = conference;
+  state.incomingConference = null;
+  state.conferencePreparing = false;
+  state.conferenceRestoring = true;
+  hideIncoming();
+  showConferenceStage();
+  startCallTimer(conferenceStartTime(conference));
+
+  if (!state.localStream) {
+    try {
+      await ensureLocalMedia(conference.media);
+    } catch (error) {
+      toast(mediaErrorText(error), 'error');
+      sendRaw({ type: 'conference.leave', data: { conference_id: conference.id } });
+      cleanupConference(null, { refresh: false });
+      return;
+    }
+  }
+  if (state.conference?.id !== conference.id) {
+    state.conferenceRestoring = false;
+    return;
+  }
+
+  state.conferenceRestoring = false;
+  const hadPeersBefore = state.conferencePeers.size > 0;
+  let hadFailedPeers = false;
+  for (const entry of [...state.conferencePeers.values()]) {
+    if (entry.pc.connectionState === 'failed' || entry.pc.connectionState === 'closed') {
+      hadFailedPeers = true;
+      closeConferencePeer(entry.peerId);
+    }
+  }
+  syncConferencePeers();
+  const pendingSignals = state.pendingConferenceSignals.splice(0);
+  for (const signal of pendingSignals) {
+    await handleConferenceSignal(signal.type, signal.data);
+  }
+
+  const meId = state.me?.id;
+  const otherJoined = (conference.joined_ids || []).filter((id) => id !== meId);
+  const lowerPeers = otherJoined.filter((id) => !conferenceShouldOffer(id));
+  const needsResync = hadFailedPeers || (!hadPeersBefore && lowerPeers.length > 0);
+  if (needsResync) {
+    sendRaw({
+      type: 'conference.resync',
+      data: { conference_id: conference.id, renegotiate: true },
+    });
+  }
+  syncWatched();
+  updateSelectionUi();
+  updateConferenceUi();
+}
+
+async function joinConferenceById() {
+  const input = $('conferenceIdInput');
+  const id = input.value.trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    toast('UUID конференции имеет неверный формат', 'error');
+    return;
+  }
+  if (state.call || state.conference) {
+    toast('Сначала завершите текущий звонок или конференцию', 'error');
+    return;
+  }
+  let conference;
+  try {
+    conference = await api('/calls/conference');
+  } catch (error) {
+    toast(error.message || 'Не удалось получить конференцию', 'error');
+    return;
+  }
+  if (!conference || conference.id !== id) {
+    toast('Конференция не найдена или нет приглашения', 'error');
+    return;
+  }
+  const self = (conference.participants || []).find(
+    (participant) => participant.user?.id === state.me?.id,
+  );
+  if (!self) {
+    toast('Нет приглашения в эту конференцию', 'error');
+    return;
+  }
+  input.value = '';
+  if (self.state === 'joined') {
+    await restoreConference(conference);
+    return;
+  }
+  state.incomingConference = conference;
+  await acceptConferenceInvite();
+}
+
+function inviteSelectedToConference() {
+  const conference = state.conference;
+  if (!conference) {
+    return;
+  }
+  const ids = selectedInviteeIds();
+  if (!ids.length) {
+    toast('Отметьте пользователей для приглашения', 'error');
+    return;
+  }
+  const sent = sendRaw({
+    type: 'conference.invite',
+    data: { conference_id: conference.id, user_ids: ids },
+  });
+  if (!sent) {
+    toast('Нет соединения с сервером сигналинга', 'error');
+    return;
+  }
+  clearSelectedInvitees();
+  toast('Приглашения отправлены', 'ok');
+}
+
 async function startCall(user, media) {
   if (!user?.id) {
     toast('Пользователь не найден', 'error');
+    return;
+  }
+  if (state.conference) {
+    toast('Сначала выйдите из конференции', 'error');
+    return;
+  }
+  if (state.incomingConference) {
+    toast('Сначала примите или отклоните приглашение в конференцию', 'error');
+    return;
+  }
+  if (state.conferencePreparing) {
+    toast('Подождите, конференция подключается', 'error');
     return;
   }
   if (state.call) {
@@ -1258,6 +2323,10 @@ async function startCallById(media) {
 }
 
 function endCall() {
+  if (state.conference) {
+    leaveConference();
+    return;
+  }
   const call = state.call;
   if (!call) {
     cleanupCall(null, { refresh: false });
@@ -1841,7 +2910,11 @@ function toggleCamera() {
   track.enabled = !track.enabled;
   updateLocalPlaceholder();
   updateMediaButtons();
-  updateDiag();
+  if (state.conference) {
+    updateConferenceUi();
+  } else {
+    updateDiag();
+  }
 }
 
 async function loadConfig() {
@@ -1904,8 +2977,34 @@ function renderHistory(items) {
     .join('');
 }
 
+function selectedInviteeIds() {
+  return [...state.selectedInvitees].filter((id) => id && id !== state.me?.id);
+}
+
+function clearSelectedInvitees() {
+  state.selectedInvitees.clear();
+  renderSearchResults();
+  updateSelectionUi();
+}
+
+function updateSelectionUi() {
+  const counter = $('confSelection');
+  if (counter) {
+    const count = selectedInviteeIds().length;
+    counter.textContent = `${count} выбрано`;
+  }
+  const inConference = Boolean(state.conference);
+  const invite = $('inviteConferenceBtn');
+  if (invite) {
+    invite.hidden = !inConference;
+  }
+  $('createConferenceAudio').hidden = inConference;
+  $('createConferenceVideo').hidden = inConference;
+}
+
 function renderSearchResults() {
   const container = $('searchResults');
+  updateSelectionUi();
   if (!state.searchResults.length) {
     container.innerHTML = '<p class="empty">Ничего не найдено.</p>';
     return;
@@ -1916,10 +3015,20 @@ function renderSearchResults() {
       const inCall = Boolean(user.in_call);
       const isMe = user.id === state.me?.id;
       const disabled = !online || inCall || isMe;
+      const pickDisabled = !online || inCall || isMe;
+      const selected = state.selectedInvitees.has(user.id);
       const presence = online ? 'в сети' : 'не в сети';
       const badge = inCall ? '<span class="badge">в звонке</span>' : '';
       return `
         <article class="user-row" data-user-id="${escapeHtml(user.id)}">
+          <label class="user-row__pick" title="Выбрать для конференции">
+            <input
+              type="checkbox"
+              data-conf-select="${escapeHtml(user.id)}"
+              ${selected ? 'checked' : ''}
+              ${pickDisabled ? 'disabled' : ''}
+            />
+          </label>
           <div class="avatar avatar--sm" style="--avatar:${colorFor(user.id)}">${escapeHtml(
             initialsFor(user),
           )}</div>
@@ -1983,6 +3092,10 @@ function logEvent(direction, type, data) {
   let summary = '';
   if (data?.call) {
     summary = `${shortId(data.call.id)} ${data.call.state} ${data.call.media}`;
+  } else if (data?.conference) {
+    summary = `${shortId(data.conference.id)} ${data.conference.state} ${
+      data.conference.media
+    } · ${(data.conference.joined_ids || []).length} уч.`;
   } else if (data?.call_id) {
     const parts = [shortId(data.call_id)];
     if (typeof data.sdp === 'string') {
@@ -2013,19 +3126,42 @@ function logEvent(direction, type, data) {
 
 function updateDiag() {
   const element = $('diagStatus');
-  if (!element) {
+  if (!element || !state.diagOpen) {
     return;
   }
   const localTracks = state.localStream
     ? state.localStream.getTracks().map((track) => track.kind).join(' + ')
     : '—';
-  const remoteTracks = state.remoteStream
-    ? state.remoteStream.getTracks().map((track) => track.kind).join(' + ')
-    : '—';
+  const remoteTracks = state.conference
+    ? [...state.conferencePeers.values()]
+        .map((entry) => entry.remoteStream?.getTracks().map((track) => track.kind).join('+'))
+        .filter(Boolean)
+        .join(', ') || '—'
+    : state.remoteStream
+      ? state.remoteStream.getTracks().map((track) => track.kind).join(' + ')
+      : '—';
   const call = state.call;
   const items = [
     ['WebSocket', state.wsStatus],
     ['Звонок', call ? `${shortId(call.id)} · ${call.state || 'preparing'} · ${call.media}` : '—'],
+    [
+      'Конференция',
+      state.conference
+        ? `${conferenceTitle()} · ${(state.conference.joined_ids || []).length} уч.`
+        : '—',
+    ],
+    [
+      'Участники',
+      state.conference
+        ? (state.conference.joined_ids || [])
+            .map((id) => displayName(conferenceUser(id)))
+            .join(', ')
+        : '—',
+    ],
+    [
+      'Peer connections',
+      state.conference ? `${state.conferencePeers.size} соединений` : state.pc ? '1' : '0',
+    ],
     ['Собеседник', state.peer ? `${displayName(state.peer)} · ${shortId(state.peer.id)}` : '—'],
     ['ICE-серверы', iceServersSummary()],
     [
@@ -2179,6 +3315,38 @@ function bindApp() {
     }
   });
 
+  $('searchResults').addEventListener('change', (event) => {
+    const input = event.target.closest('[data-conf-select]');
+    if (!input) {
+      return;
+    }
+    const userId = input.dataset.confSelect;
+    if (input.checked) {
+      state.selectedInvitees.add(userId);
+    } else {
+      state.selectedInvitees.delete(userId);
+    }
+    updateSelectionUi();
+  });
+
+  $('createConferenceAudio').addEventListener('click', () => {
+    void createConference('audio');
+  });
+  $('createConferenceVideo').addEventListener('click', () => {
+    void createConference('video');
+  });
+  $('inviteConferenceBtn').addEventListener('click', inviteSelectedToConference);
+  $('joinConferenceBtn').addEventListener('click', () => {
+    void joinConferenceById();
+  });
+  $('conferenceIdInput').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void joinConferenceById();
+    }
+  });
+  $('endForAllBtn').addEventListener('click', endConferenceForAll);
+
   document.querySelectorAll('[data-id-call]').forEach((button) => {
     button.addEventListener('click', () => {
       void startCallById(button.dataset.idCall);
@@ -2233,13 +3401,24 @@ function bindApp() {
 
   window.addEventListener('pagehide', () => {
     const call = state.call;
-    if (call?.id && state.ws?.readyState === WebSocket.OPEN) {
-      try {
+    const conference = state.conference;
+    if (state.ws?.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    try {
+      if (conference?.id) {
+        state.ws.send(
+          JSON.stringify({
+            type: 'conference.leave',
+            data: { conference_id: conference.id },
+          }),
+        );
+      } else if (call?.id) {
         state.ws.send(
           JSON.stringify({ type: 'call.hangup', data: { call_id: call.id } }),
         );
-      } catch {
-        }
+      }
+    } catch {
     }
   });
 }

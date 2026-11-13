@@ -6,9 +6,11 @@ from app.api.deps import (
     AuthContext,
     get_auth_context,
     get_backend,
+    get_conferences,
     get_connections,
     get_registry,
 )
+from app.realtime.conferences import ConferenceRegistry
 from app.realtime.connections import ConnectionManager
 from app.realtime.registry import CallRegistry
 from app.schemas.calls import IdentityOut
@@ -21,12 +23,16 @@ router = APIRouter(prefix="/users", tags=["users"])
 async def get_me(
     context: AuthContext = Depends(get_auth_context),
     registry: CallRegistry = Depends(get_registry),
+    conferences: ConferenceRegistry = Depends(get_conferences),
     connections: ConnectionManager = Depends(get_connections),
 ) -> dict:
     return {
         **context.identity.to_public(),
         "online": connections.is_online(context.identity.id),
-        "in_call": registry.is_in_call(context.identity.id),
+        "in_call": (
+            registry.is_in_call(context.identity.id)
+            or conferences.is_in_conference(context.identity.id)
+        ),
     }
 
 
@@ -38,6 +44,7 @@ async def search_users(
     backend: BackendClient = Depends(get_backend),
     connections: ConnectionManager = Depends(get_connections),
     registry: CallRegistry = Depends(get_registry),
+    conferences: ConferenceRegistry = Depends(get_conferences),
 ) -> list[dict]:
     try:
         users = await backend.search_users(context.token, q, limit)
@@ -57,7 +64,7 @@ async def search_users(
                 "username": user.get("username"),
                 "display_name": user.get("display_name"),
                 "online": connections.is_online(user_id),
-                "in_call": registry.is_in_call(user_id),
+                "in_call": (registry.is_in_call(user_id) or conferences.is_in_conference(user_id)),
             }
         )
     return result
