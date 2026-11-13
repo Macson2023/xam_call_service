@@ -1,0 +1,227 @@
+name: xam
+
+# Production stack:
+#   FRONTEND_DOMAIN             -> frontend (React/Vite via nginx)
+#   BACKEND_DOMAIN              -> backend (FastAPI)
+#   CALLS_DOMAIN                -> call service (FastAPI + WebSocket)
+#
+# Caddy terminates TLS (Let's Encrypt) and routes by hostname.
+# Only Caddy, coturn and SSH are reachable from the internet.
+#
+# Run from this directory:
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+#
+# The frontend/backend repositories are expected next to this one:
+#   /opt/xam/xam_frontend
+#   /opt/xam/xam_backend
+#   /opt/xam/xam_call_service
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: xam_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xam}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:-xam}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xam} -d ${POSTGRES_DB:-xam}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../../../xam_backend
+      dockerfile: Dockerfile
+    image: xam_backend:prod
+    container_name: xam_backend
+    environment:
+      APP_NAME: xam_backend
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env.production}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-xam}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-xam}
+      DATABASE_ECHO: "false"
+      AUTO_CREATE_TABLES: "false"
+      RUN_MIGRATIONS: "true"
+      UPLOAD_DIR: /app/uploads
+      MEDIA_URL_PREFIX: /media
+      MAX_IMAGE_SIZE_BYTES: ${MAX_IMAGE_SIZE_BYTES:-5242880}
+      MAX_AUDIO_SIZE_BYTES: ${MAX_AUDIO_SIZE_BYTES:-26214400}
+      MAX_VIDEO_NOTE_SIZE_BYTES: ${MAX_VIDEO_NOTE_SIZE_BYTES:-26214400}
+      CORS_ORIGINS: "https://${FRONTEND_DOMAIN:-example.com},https://www.${FRONTEND_DOMAIN:-example.com}"
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  calls:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: xam_call_service:prod
+    container_name: xam_calls
+    environment:
+      APP_NAME: xam_call_service
+      DEBUG: "false"
+
+      AUTH_MODE: jwt
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env.production}
+      JWT_ALGORITHMS: ${JWT_ALGORITHMS:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-}
+      OAUTH2_JWKS_URL: ${OAUTH2_JWKS_URL:-}
+      OAUTH2_INTROSPECTION_URL: ${OAUTH2_INTROSPECTION_URL:-}
+      OAUTH2_CLIENT_ID: ${OAUTH2_CLIENT_ID:-}
+      OAUTH2_CLIENT_SECRET: ${OAUTH2_CLIENT_SECRET:-}
+      AUTH_ENRICH_USERINFO: "true"
+      USERINFO_CACHE_TTL_SECONDS: "300"
+
+      # Internal Docker network name of the backend.
+      BACKEND_BASE_URL: http://backend:8000
+      BACKEND_USERINFO_PATH: /api/v1/users/me
+      BACKEND_TIMEOUT_SECONDS: "5"
+
+      DATABASE_URL: sqlite+aiosqlite:////app/data/calls.db
+      AUTO_CREATE_TABLES: "true"
+
+      RING_TIMEOUT_SECONDS: ${RING_TIMEOUT_SECONDS:-45}
+      DISCONNECT_GRACE_SECONDS: ${DISCONNECT_GRACE_SECONDS:-10}
+      MAX_CALL_DURATION_SECONDS: ${MAX_CALL_DURATION_SECONDS:-14400}
+      MAX_CONFERENCE_PARTICIPANTS: ${MAX_CONFERENCE_PARTICIPANTS:-8}
+      WS_TICKET_TTL_SECONDS: ${WS_TICKET_TTL_SECONDS:-30}
+      MAX_WS_MESSAGE_BYTES: ${MAX_WS_MESSAGE_BYTES:-98304}
+      WS_IDLE_TIMEOUT_SECONDS: ${WS_IDLE_TIMEOUT_SECONDS:-180}
+      WS_SEND_TIMEOUT_SECONDS: ${WS_SEND_TIMEOUT_SECONDS:-5}
+
+      # Built from SERVER_IP so a new server IP only needs one change.
+      ICE_SERVERS: '[{"urls":["stun:${SERVER_IP:?Set SERVER_IP in .env.production}:3478","stun:stun.l.google.com:19302"]}]'
+      TURN_URLS: "turn:${SERVER_IP:?Set SERVER_IP in .env.production}:3478?transport=udp,turn:${SERVER_IP:?Set SERVER_IP in .env.production}:3478?transport=tcp"
+      TURN_USERNAME: ${TURN_USERNAME:-xam}
+      TURN_CREDENTIAL: ${TURN_CREDENTIAL:?Set TURN_CREDENTIAL in .env.production}
+
+      CORS_ORIGINS: "https://${FRONTEND_DOMAIN:-example.com},https://www.${FRONTEND_DOMAIN:-example.com}"
+    volumes:
+      - calls_data:/app/data
+    depends_on:
+      backend:
+        condition: service_healthy
+    expose:
+      - "8081"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../../../xam_frontend
+      dockerfile: Dockerfile
+      args:
+        # The browser talks to the public subdomains directly.
+        VITE_API_URL: https://${BACKEND_DOMAIN:-backend.example.com}
+        VITE_WS_URL: https://${BACKEND_DOMAIN:-backend.example.com}
+        VITE_CALLS_URL: https://${CALLS_DOMAIN:-callservice.example.com}
+    image: xam_frontend:prod
+    container_name: xam_frontend
+    environment:
+      # Same-origin fallbacks inside the frontend nginx. Not used while the
+      # VITE_* URLs above point at the public subdomains, but kept functional.
+      BACKEND_ORIGIN: http://backend:8000
+      CALLS_ORIGIN: http://calls:8081
+      TLS_HOSTS: "${FRONTEND_DOMAIN:-example.com},www.${FRONTEND_DOMAIN:-example.com}"
+      TLS_CN: ${FRONTEND_DOMAIN:-example.com}
+      TLS_CERT_DAYS: "825"
+      TLS_REGENERATE: "0"
+    expose:
+      - "80"
+      - "443"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # STUN/TURN for WebRTC. Host networking avoids Docker's slow UDP port range
+  # proxying and lets coturn bind the relay ports directly.
+  turn:
+    image: coturn/coturn:4.6.3
+    container_name: xam_turn
+    network_mode: host
+    command:
+      - --log-file=stdout
+      - --listening-ip=0.0.0.0
+      - --listening-port=3478
+      - --fingerprint
+      - --lt-cred-mech
+      - --realm=${TURN_REALM:-xam}
+      - --user=${TURN_USERNAME:-xam}:${TURN_CREDENTIAL:?Set TURN_CREDENTIAL in .env.production}
+      - --external-ip=${TURN_EXTERNAL_IP:?Set TURN_EXTERNAL_IP in .env.production}
+      - --min-port=${TURN_MIN_PORT:-49160}
+      - --max-port=${TURN_MAX_PORT:-49300}
+      - --no-tls
+      - --no-dtls
+      - --no-cli
+      - --no-multicast-peers
+      - --no-software-attribute
+      - --stale-nonce=600
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: xam_caddy
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+      FRONTEND_DOMAIN: ${FRONTEND_DOMAIN:-example.com}
+      BACKEND_DOMAIN: ${BACKEND_DOMAIN:-backend.example.com}
+      CALLS_DOMAIN: ${CALLS_DOMAIN:-callservice.example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      calls:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  uploads_data:
+  calls_data:
+  caddy_data:
+  caddy_config:

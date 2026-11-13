@@ -1,0 +1,22 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# Frontend (React/Vite). www is optional; create a DNS record for it or remove
+# it from the address list.
+{$FRONTEND_DOMAIN}, www.{$FRONTEND_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy frontend:80
+}
+
+# REST + WebSocket backend.
+{$BACKEND_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy backend:8000
+}
+
+# Call signaling: REST + WebSocket + the bundled test client.
+{$CALLS_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy calls:8081
+}
