@@ -600,4 +600,25 @@ tests/             # pytest: auth, registry, signaling, proxy
 | Браузер не даёт камеру | Открывайте `localhost` или HTTPS, разрешите доступ |
 | `Auth service is unavailable` | `xam_backend` не запущен или неверный `BACKEND_BASE_URL` |
 | История пустая сразу после звонка | Обновите: запись сохраняется фоновой задачей; API истории дожидается её |
+
+## Production (`xamlotoc.ru`)
+
+Готовый production-стек лежит в [`deploy/production`](deploy/production/):
+
+- `xamlotoc.ru` / `www.xamlotoc.ru` — фронтенд;
+- `backend.xamlotoc.ru` — бэкенд;
+- `callservice.xamlotoc.ru` — сервис звонков.
+
+Там же `docker-compose.prod.yml`, `Caddyfile` (TLS Let's Encrypt), пример
+окружения `.env.production.example`, серверный `deploy.sh` и Windows-скрипт
+публикации `publish.ps1`. IP сервера в примере — заглушка `203.0.113.10`.
+
+```powershell
+cd deploy/production
+copy .env.production.example .env.production
+# заполните SERVER_IP, TURN_EXTERNAL_IP, ACME_EMAIL и секреты
+.\publish.ps1
+```
+
+Подробности: [`deploy/production/README.md`](deploy/production/README.md).
 ```
